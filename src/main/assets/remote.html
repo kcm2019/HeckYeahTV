@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>HeckYeah Remote</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; padding: 0; height: 100%; }
+  body {
+    background: #1c1c1e; color: #f2f2f7;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column; height: 100dvh; overflow: hidden;
+    user-select: none; -webkit-user-select: none;
+  }
+  header {
+    padding: 10px 14px 8px; background: #2c2c2e; border-bottom: 1px solid #3a3a3c;
+    display: flex; align-items: center; gap: 10px;
+  }
+  #dot { width: 10px; height: 10px; border-radius: 50%; background: #ff453a; flex: 0 0 auto; }
+  #dot.on { background: #30d158; }
+  #nowTitle { font-size: 15px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #nowUrl { font-size: 12px; color: #98989f; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #nowWrap { min-width: 0; }
+  #pad {
+    flex: 1 1 auto; margin: 12px; border-radius: 18px; background: #2c2c2e;
+    border: 1px solid #3a3a3c; touch-action: none; position: relative;
+  }
+  #padHint {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: #636366; font-size: 14px; text-align: center; padding: 20px; pointer-events: none;
+  }
+  .row { display: flex; gap: 8px; padding: 0 12px 8px; }
+  button {
+    flex: 1 1 0; background: #3a3a3c; color: #f2f2f7; border: 0; border-radius: 12px;
+    padding: 13px 4px; font-size: 15px; font-weight: 600; cursor: pointer;
+  }
+  button:active { background: #0a84ff; }
+  button:disabled { opacity: 0.35; }
+  .accent { background: #0a84ff; }
+  .bar { display: flex; gap: 8px; padding: 0 12px 8px; }
+  .bar input {
+    flex: 1 1 auto; min-width: 0; background: #2c2c2e; color: #f2f2f7;
+    border: 1px solid #3a3a3c; border-radius: 12px; padding: 12px;
+    font-size: 16px; outline: none;
+  }
+  .bar button { flex: 0 0 auto; padding: 12px 16px; }
+  #note { min-height: 18px; padding: 0 14px 6px; font-size: 13px; color: #ffd60a; }
+  #footNote { padding: 0 14px 10px; font-size: 12px; color: #98989f; display: none; }
+  #overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.88);
+    display: none; align-items: center; justify-content: center; z-index: 10;
+  }
+  #overlay.show { display: flex; }
+  #pairBox {
+    background: #2c2c2e; border-radius: 18px; padding: 24px; width: min(320px, 86vw);
+    display: flex; flex-direction: column; gap: 12px; text-align: center;
+  }
+  #pairBox h1 { font-size: 19px; margin: 0; }
+  #pairBox p { margin: 0; color: #98989f; font-size: 14px; }
+  #pinInput {
+    background: #1c1c1e; color: #f2f2f7; border: 1px solid #3a3a3c; border-radius: 12px;
+    padding: 14px; font-size: 26px; text-align: center; letter-spacing: 10px; outline: none;
+  }
+  #pairErr { color: #ff453a; font-size: 13px; min-height: 16px; }
+</style>
+</head>
+<body>
+<header>
+  <div id="dot"></div>
+  <div id="nowWrap">
+    <div id="nowTitle">HeckYeah Remote</div>
+    <div id="nowUrl">connecting…</div>
+  </div>
+</header>
+
+<div id="pad"><div id="padHint">Drag to move the cursor<br>Tap to click · Hold for long-press<br>Two fingers to scroll</div></div>
+
+<div class="row">
+  <button id="btnBack">‹ Back</button>
+  <button id="btnFwd">Forward ›</button>
+  <button id="btnReload">⟳ Reload</button>
+  <button id="btnPlay">⏯ Play/Pause</button>
+  <button id="btnDone">✕ Done</button>
+</div>
+
+<div class="bar">
+  <input id="urlInput" type="url" placeholder="Search or enter website name" autocomplete="off" autocapitalize="off" spellcheck="false">
+  <button id="btnGo" class="accent">Go</button>
+</div>
+
+<div class="bar">
+  <input id="typeInput" type="text" placeholder="Type into the page…" autocomplete="off" autocapitalize="off" spellcheck="false">
+  <button id="btnType">Send</button>
+  <button id="btnEnter">Enter ↵</button>
+</div>
+
+<div class="row">
+  <button id="btnVolDown">Vol −</button>
+  <button id="btnSeekBack">⏪ 10s</button>
+  <button id="btnSeekFwd">10s ⏩</button>
+  <button id="btnVolUp">Vol +</button>
+</div>
+
+<div id="note"></div>
+<div id="footNote">The browser isn't open on the TV right now — open a site there first; trackpad and page controls apply to the browser.</div>
+
+<div id="overlay">
+  <div id="pairBox">
+    <h1>Pair this phone</h1>
+    <p>Enter the 4-digit PIN shown on the TV under “Phone remote”.</p>
+    <input id="pinInput" inputmode="numeric" pattern="[0-9]*" maxlength="4" placeholder="••••" autocomplete="one-time-code">
+    <button id="btnPair" class="accent">Pair</button>
+    <div id="pairErr"></div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var ws = null;
+  var connected = false;
+  var reconnectTimer = null;
+  var reconnectDelay = 800;
+  var intentionalClose = false;
+
+  var dot = document.getElementById("dot");
+  var nowTitle = document.getElementById("nowTitle");
+  var nowUrl = document.getElementById("nowUrl");
+  var noteEl = document.getElementById("note");
+  var footNote = document.getElementById("footNote");
+  var urlInput = document.getElementById("urlInput");
+  var typeInput = document.getElementById("typeInput");
+  var overlay = document.getElementById("overlay");
+  var pinInput = document.getElementById("pinInput");
+  var pairErr = document.getElementById("pairErr");
+  var noteTimer = null;
+
+  function setConnected(on) {
+    connected = on;
+    dot.className = on ? "on" : "";
+    if (!on) nowUrl.textContent = "disconnected";
+  }
+
+  function showNote(text) {
+    noteEl.textContent = text || "";
+    if (noteTimer) clearTimeout(noteTimer);
+    if (text) noteTimer = setTimeout(function () { noteEl.textContent = ""; }, 5000);
+  }
+
+  function send(obj) {
+    if (ws && ws.readyState === 1) {
+      try { ws.send(JSON.stringify(obj)); } catch (e) { /* socket dying */ }
+    }
+  }
+
+  function handleState(s) {
+    if (s.title) nowTitle.textContent = s.title;
+    if (typeof s.url === "string" && document.activeElement !== urlInput)
+      urlInput.value = s.url;
+    nowUrl.textContent = s.url || "";
+    footNote.style.display = s.browser ? "none" : "block";
+    document.getElementById("btnBack").disabled = !s.canBack;
+    document.getElementById("btnFwd").disabled = !s.canFwd;
+    if (s.note) showNote(s.note);
+  }
+
+  function connect() {
+    if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+    var proto = location.protocol === "https:" ? "wss://" : "ws://";
+    try {
+      ws = new WebSocket(proto + location.host + "/ws");
+    } catch (e) {
+      scheduleReconnect();
+      return;
+    }
+    ws.onopen = function () {
+      setConnected(true);
+      reconnectDelay = 800;
+      overlay.className = "";
+      pairErr.textContent = "";
+    };
+    ws.onmessage = function (ev) {
+      var msg = null;
+      try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      if (msg && msg.t === "state") handleState(msg);
+    };
+    ws.onclose = function () {
+      setConnected(false);
+      ws = null;
+      if (intentionalClose) return;
+      // A refused upgrade (401: not paired, or session dropped)
+      // also lands here; try one quick reconnect, then ask for PIN.
+      scheduleReconnect();
+    };
+    ws.onerror = function () {
+      // The server answers unpaired upgrades with HTTP 401, which
+      // surfaces here as an error followed by close. Show pairing.
+      overlay.className = "show";
+    };
+  }
+
+  function scheduleReconnect() {
+    if (reconnectTimer) return;
+    reconnectTimer = setTimeout(function () {
+      reconnectTimer = null;
+      reconnectDelay = Math.min(reconnectDelay * 1.6, 6000);
+      connect();
+    }, reconnectDelay);
+  }
+
+  document.getElementById("btnPair").addEventListener("click", function () {
+    var pin = (pinInput.value || "").trim();
+    if (pin.length !== 4) { pairErr.textContent = "Enter the 4-digit PIN."; return; }
+    pairErr.textContent = "";
+    fetch("/pair", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pin: pin })
+    }).then(function (r) {
+      return r.json().then(function (j) { return { status: r.status, body: j }; });
+    }).then(function (res) {
+      if (res.status === 200 && res.body && res.body.ok) {
+        overlay.className = "";
+        reconnectDelay = 800;
+        connect();
+      } else if (res.status === 429) {
+        pairErr.textContent = "Too many wrong tries — wait a minute and try again.";
+      } else if (res.status === 403) {
+        pairErr.textContent = "Two phones are already paired. Disconnect one on the TV first.";
+      } else {
+        pairErr.textContent = "Wrong PIN — check the TV and try again.";
+      }
+    }).catch(function () {
+      pairErr.textContent = "Could not reach the TV. Same Wi-Fi network?";
+    });
+  });
+
+  // ------------------------------------------------------------ buttons
+  function bind(id, fn) { document.getElementById(id).addEventListener("click", fn); }
+  bind("btnBack", function () { send({ t: "back" }); });
+  bind("btnFwd", function () { send({ t: "fwd" }); });
+  bind("btnReload", function () { send({ t: "reload" }); });
+  bind("btnPlay", function () { send({ t: "playpause" }); });
+  bind("btnDone", function () { send({ t: "done" }); });
+  bind("btnVolDown", function () { send({ t: "vol", d: -1 }); });
+  bind("btnVolUp", function () { send({ t: "vol", d: 1 }); });
+  bind("btnSeekBack", function () { send({ t: "seek", s: -10 }); });
+  bind("btnSeekFwd", function () { send({ t: "seek", s: 10 }); });
+  bind("btnGo", function () {
+    var u = (urlInput.value || "").trim();
+    if (u) send({ t: "url", u: u });
+    urlInput.blur();
+  });
+  urlInput.addEventListener("keydown", function (ev) {
+    if (ev.key === "Enter") document.getElementById("btnGo").click();
+  });
+  bind("btnType", function () {
+    var text = typeInput.value || "";
+    if (text) send({ t: "type", text: text });
+    typeInput.value = "";
+  });
+  bind("btnEnter", function () { send({ t: "key", k: "enter" }); });
+
+  // ------------------------------------------------------------ trackpad
+  var pad = document.getElementById("pad");
+  var touches = {};        // identifier -> {x, y}
+  var touchCount = 0;
+  var lastX = 0, lastY = 0;   // single-finger tracking
+  var lastMidY = 0;           // two-finger midpoint
+  var downAt = 0;
+  var moved = 0;
+  var longTimer = null;
+  var longFired = false;
+  var scrollAccum = 0;
+
+  function pos(t) {
+    var r = pad.getBoundingClientRect();
+    return { x: t.clientX - r.left, y: t.clientY - r.top };
+  }
+  function cancelLong() {
+    if (longTimer) { clearTimeout(longTimer); longTimer = null; }
+  }
+
+  pad.addEventListener("touchstart", function (ev) {
+    ev.preventDefault();
+    for (var i = 0; i < ev.changedTouches.length; i++) {
+      var t = ev.changedTouches[i];
+      touches[t.identifier] = pos(t);
+      touchCount++;
+    }
+    if (touchCount === 1) {
+      var p0 = pos(ev.changedTouches[0]);
+      lastX = p0.x; lastY = p0.y;
+      downAt = Date.now();
+      moved = 0;
+      longFired = false;
+      cancelLong();
+      longTimer = setTimeout(function () {
+        longFired = true;
+        send({ t: "longtap" });
+      }, 500);
+    } else if (touchCount === 2) {
+      cancelLong();
+      var pts = Object.keys(touches).map(function (k) { return touches[k]; });
+      lastMidY = (pts[0].y + pts[1].y) / 2;
+      scrollAccum = 0;
+    }
+  }, { passive: false });
+
+  pad.addEventListener("touchmove", function (ev) {
+    ev.preventDefault();
+    for (var i = 0; i < ev.changedTouches.length; i++) {
+      var t = ev.changedTouches[i];
+      if (touches[t.identifier]) touches[t.identifier] = pos(t);
+    }
+    if (touchCount === 1) {
+      var p = pos(ev.changedTouches[0]);
+      var dx = p.x - lastX, dy = p.y - lastY;
+      lastX = p.x; lastY = p.y;
+      var dist = Math.abs(dx) + Math.abs(dy);
+      moved += dist;
+      if (moved > 12) cancelLong();
+      if (dist > 0) {
+        // Simple velocity acceleration: longer strides move faster.
+        var gain = 1 + Math.min(1.6, dist / 26);
+        send({ t: "move", dx: Math.round(dx * gain), dy: Math.round(dy * gain) });
+      }
+    } else if (touchCount === 2) {
+      var pts = Object.keys(touches).map(function (k) { return touches[k]; });
+      if (pts.length === 2) {
+        var midY = (pts[0].y + pts[1].y) / 2;
+        var sdy = midY - lastMidY;
+        lastMidY = midY;
+        scrollAccum += sdy;
+        if (Math.abs(scrollAccum) >= 6) {
+          // Finger drags down = page follows finger (scroll up content):
+          // send the negated delta, matching touch-scroll convention.
+          send({ t: "scroll", dy: Math.round(-scrollAccum * 3) });
+          scrollAccum = 0;
+        }
+      }
+    }
+  }, { passive: false });
+
+  function touchEnd(ev) {
+    ev.preventDefault();
+    var ended = ev.changedTouches.length;
+    for (var i = 0; i < ev.changedTouches.length; i++)
+      delete touches[ev.changedTouches[i].identifier];
+    if (touchCount === 1 && ended > 0) {
+      cancelLong();
+      var quick = Date.now() - downAt < 300;
+      if (!longFired && quick && moved < 12) send({ t: "tap" });
+    }
+    touchCount = Math.max(0, touchCount - ended);
+    if (touchCount < 2) scrollAccum = 0;
+    if (touchCount === 1) {
+      // Re-anchor single-finger tracking after a two-finger gesture.
+      var keys = Object.keys(touches);
+      if (keys.length === 1) {
+        lastX = touches[keys[0]].x; lastY = touches[keys[0]].y;
+        downAt = Date.now(); moved = 99; // no tap after a scroll gesture
+      }
+    }
+  }
+  pad.addEventListener("touchend", touchEnd, { passive: false });
+  pad.addEventListener("touchcancel", touchEnd, { passive: false });
+
+  // Mouse fallback (desktop testing of the page).
+  var mouseDown = false, mouseMoved = 0, mouseAt = 0, mX = 0, mY = 0;
+  pad.addEventListener("mousedown", function (ev) {
+    mouseDown = true; mouseMoved = 0; mouseAt = Date.now();
+    mX = ev.clientX; mY = ev.clientY;
+  });
+  pad.addEventListener("mousemove", function (ev) {
+    if (!mouseDown) return;
+    var dx = ev.clientX - mX, dy = ev.clientY - mY;
+    mX = ev.clientX; mY = ev.clientY;
+    mouseMoved += Math.abs(dx) + Math.abs(dy);
+    if (dx || dy) send({ t: "move", dx: dx, dy: dy });
+  });
+  pad.addEventListener("mouseup", function () {
+    if (mouseDown && Date.now() - mouseAt < 300 && mouseMoved < 6) send({ t: "tap" });
+    mouseDown = false;
+  });
+
+  connect();
+})();
+</script>
+</body>
+</html>

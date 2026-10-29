@@ -21,6 +21,10 @@ in-app browser built for D-pad and mouse-style remote navigation.
   for in-page "pseudo-fullscreen" players)
 - Host-level ad/tracker and popup blocking, video-aware scroll
   clamping, and fullscreen diagnostics under the `HeckYeahFS` log tag
+- Phone remote: a web page served by the app lets a phone on the
+  same Wi-Fi act as a trackpad + browser controller (navigation,
+  URL entry, typing into the page, volume and seek), paired with
+  a PIN shown on the TV — see "Phone remote" below
 
 ## Requirements
 
@@ -51,6 +55,34 @@ adb connect <device-ip>:5555
 adb install -r build/manual/apk/HeckYeah.apk
 adb shell monkey -p com.heckyeah.tv -c android.intent.category.LAUNCHER 1
 ```
+
+## Phone remote
+
+With **Settings → Phone remote** turned on, the app serves a
+control page on your local network at `http://<device-ip>:18765`.
+Open it in a phone browser (no app to install), enter the 4-digit
+PIN shown on the TV under **browser menu / browser settings →
+Phone remote…**, and the phone becomes a trackpad and browser
+controller: cursor movement, taps and long-presses, scrolling,
+Back / Forward / Reload / Play-Pause / Done, URL entry with the
+phone keyboard, typing into the focused field on the page,
+±10-second seek, and volume. The TV panel also shows a QR code
+for the address and the paired-phone count (up to 2), and can
+regenerate the PIN or disconnect all phones.
+
+Permissions used by this feature (both normal Android
+permissions): `ACCESS_WIFI_STATE` (to display the device's Wi-Fi
+address in the pairing panel) and `MODIFY_AUDIO_SETTINGS` (the
+phone's volume buttons).
+
+**Security:** the remote is **off by default**. It is a
+LAN convenience, not an internet service: pairing requires the
+PIN shown on the TV, the PIN is regenerated at every server
+start, session tokens live in memory only (a restart means
+re-pairing), and 5 failed pairing attempts lock pairing for 60
+seconds. Anyone who can see the TV screen and reach the device
+on your network can pair — turn it off on networks you do not
+trust.
 
 ## Limits
 
@@ -191,6 +223,113 @@ export KEYSTORE_PASS='change-me'
 export KEY_PASS="$KEYSTORE_PASS"
 ./build.sh   # → build/manual/apk/HeckYeah.apk
 ```
+
+## v1.19 (Oct 28, 2026) — phone remote (Core + A–E)
+
+A phone on the same Wi-Fi network becomes a trackpad and browser
+controller through a web page the app itself serves. Core + all
+five extras were picked.
+
+- **Server (`RemoteServer`, new):** hand-rolled HTTP + WebSocket
+  (RFC 6455: SHA-1/Base64 accept, masked client frames unmasked,
+  ping→pong, close, minimal fragmentation tolerance) on port
+  18765, framework APIs only. 1 accept thread + at most 6
+  connection threads; every command is posted to the UI handler;
+  everything exception-guarded so the server cannot crash the
+  app. Serves `assets/remote.html` at `GET /`, pairing at
+  `POST /pair`, control channel at `GET /ws` (cookie-gated).
+- **Lifecycle/settings:** pref `remote_on`, **default OFF**;
+  Settings row "Phone remote"; server starts in `onCreate` when
+  the pref is on, stops in `onDestroy`, and follows the toggle
+  immediately. Browser menu and browser settings gained
+  "Phone remote…", opening the TV pairing panel (address, PIN,
+  QR, paired count n/2, "New PIN", "Disconnect all"; an inline
+  "Turn on" when the server is off).
+- **Pairing/security (Core + E):** 4-digit PIN regenerated at
+  every server start; a successful pair issues a UUID session
+  cookie kept **in memory only**; max **2** concurrent sessions;
+  5 failed attempts lock pairing for 60 s (HTTP 429); unpaired
+  `/ws` upgrades get 401. "New PIN" regenerates the PIN and drops
+  all sessions; "Disconnect all" drops sessions.
+- **Phone page (`assets/remote.html`, new):** self-contained dark
+  page — PIN overlay (auto-shown when the socket is refused),
+  live header (current title + URL, connection dot), trackpad
+  (drag = move with velocity acceleration; the server applies a
+  1.6× gain before `moveCursor`; tap = click; ~500 ms hold =
+  long-tap; two-finger vertical drag = scroll), Back / Forward /
+  Reload / Play-Pause / Done, URL bar (submit reuses
+  `loadResolved`, the exact normalization of the TV URL dialog),
+  "type into page" field + Enter (extra C), and a media row
+  (extra D). A footer note appears when the browser isn't open
+  on the TV. Page JS was extracted and passed `node --check`.
+- **Commands reuse the app's own internals:** move →
+  `moveCursor` (edge-scroll and fade-poke intact), tap/long-tap
+  → `dispatchTap`/`dispatchFsTap`/`dispatchLongTap` at the
+  cursor (fullscreen taps go to the fullscreen surface), scroll
+  → `doScrollBy` (so the document/video clamps and the
+  fullscreen and pseudo-fullscreen freezes govern the phone
+  exactly like the remote), play/pause → FS center tap or
+  `togglePlayJs`, Done → `closeBrowser`. Page commands are
+  browser-gated; volume is global.
+- **State pushes:** `{t:"state", title, url, fs, mouse, browser,
+  canBack, canFwd, paired}` on navigation callbacks
+  (`onPageStarted`/`onPageFinished`/`doUpdateVisitedHistory`/
+  `onReceivedTitle`), on real- and pseudo-fullscreen
+  transitions, on pairing changes, on browser close, and on a
+  2.5 s heartbeat. A failed type-in sets a one-shot `note` in
+  the next push ("No text field focused on TV").
+- **Extra A — QR code (`QrCode`, new):** compact QR generator
+  (byte mode, ECC level M, versions 1–10, algorithm structure
+  after the MIT-licensed Nayuki generator) rendered to a bitmap
+  with a 4-module quiet zone in the pairing panel. Verified
+  standalone on a desktop JVM before building: a
+  25-character `http://<device-ip>:18765` address selects
+  version 2 / 25×25 and a 94-character input selects version
+  6 / 41×41 (4 blocks); format-information BCH validated with
+  ECC indicator 00 (M); Reed-Solomon syndromes all zero under
+  an independent GF(256) implementation; the encoded bitstream
+  round-trips to the exact input.
+- **Extra B — mDNS:** `NsdManager` advertises "HeckYeah TV"
+  (`_http._tcp.`, port 18765) with the server start/stop, all
+  callbacks guarded (failure never affects the server). The
+  panel prints `http://HeckYeah-TV.local:18765` as a secondary
+  address (resolution reliable on iPhone; Android may need the
+  IP, which comes from `WifiManager` with a `NetworkInterface`
+  fallback).
+- **Extra C — type into page:** injected JS inserts the text at
+  the caret of the focused input/textarea/contenteditable
+  (setRangeText where available, `execCommand('insertText')`
+  for contenteditable) in the top document and same-origin
+  iframes, dispatches `input`, and reports back; Enter fires
+  keydown/keypress/keyup (keyCode 13) at the focused element.
+- **Extra D — media keys:** volume via `AudioManager.
+  adjustStreamVolume(STREAM_MUSIC, …, FLAG_SHOW_UI)`; seek
+  moves the biggest playing (else first) `<video>` by ±10 s
+  (same-origin iframes included).
+- **Manifest:** versionCode **20** / versionName **1.19**;
+  permissions are now INTERNET, ACCESS_NETWORK_STATE,
+  ACCESS_WIFI_STATE and MODIFY_AUDIO_SETTINGS (the last two are
+  new, both normal permissions).
+- `alive version=1.19 code=20`.
+
+Build verification (compile-verified; **all network behavior is
+device-test-only** — nothing about the server, pairing,
+WebSocket, mDNS, or the phone page has run on hardware yet):
+
+- `aapt2 dump badging`: `com.heckyeah.tv` versionCode **20** /
+  versionName **1.19**, sdk 25 / target 25, permissions
+  INTERNET + ACCESS_NETWORK_STATE + ACCESS_WIFI_STATE +
+  MODIFY_AUDIO_SETTINGS.
+- APK: 586,984 bytes, sha256
+  `738344285e0acdef1ec4392da4daf883018bc90ebf29fcd712902ca4b2bdd7a0`;
+  `assets/remote.html` (14,615 bytes) present in the APK.
+- `apksigner verify`: OK; signer certificate SHA-256
+  `220529f9…b92fab5` (unchanged signing key).
+- `unzip -t`: no errors.
+- QR encoder: desktop-JVM checks above passed (version
+  selection, format BCH, RS syndromes, payload round-trip).
+- Phone page JS: extracted from the HTML and passed
+  `node --check`.
 
 ## v1.18 (Oct 28, 2026) — package rename + public repo prep
 

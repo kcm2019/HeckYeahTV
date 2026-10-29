@@ -21,6 +21,7 @@ import android.graphics.Paint;
 import android.graphics.Rect;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.media.AudioManager;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
@@ -123,6 +124,7 @@ public class MainActivity extends Activity {
     private static final String KEY_DESKTOP_UA = "desktop_ua";
     private static final String KEY_APPEARANCE = "browser_appearance"; // dark (default) | light
     private static final String KEY_VIDEO_LOCK = "video_scroll_lock"; // v1.13: default ON
+    private static final String KEY_REMOTE = "remote_on"; // v1.19: phone remote server, default OFF
     private static final String KEY_RESUME = "resume_state";    // url SEP title SEP applet SEP cat SEP ts SEP seek
     private static final String SEP = "\u0001";
     private static final int RW_CAP = 12;
@@ -946,6 +948,7 @@ public class MainActivity extends Activity {
     private TextView settingsStatus, browserTitle;
     private Button browserModeBtnSettings, adblockBtnSettings, cursorBtnSettings, scaleBtnSettings;
     private Button videoLockBtnSettings; // v1.13
+    private Button remoteBtnSettings; // v1.19
 
     private WebView webView;
     private LinearLayout browserCol;
@@ -1211,6 +1214,7 @@ public class MainActivity extends Activity {
                         Log.d("HeckYeahFS", "pseudofs OFF");
                         cancelFsFade(); // v1.17: restore a faded cursor, kill the timer
                     }
+                    if (pseudoFs != wasPseudo) pushRemoteState(); // v1.19
                 } catch (Exception ignored) {}
             });
         } catch (Exception ignored) {}
@@ -1339,7 +1343,7 @@ public class MainActivity extends Activity {
         // THIS build leaves exactly one unmistakable line, so
         // an empty HeckYeahFS dump can never again be confused
         // with "the guard saw nothing to fix".
-        Log.d("HeckYeahFS", "alive version=1.18 code=19");
+        Log.d("HeckYeahFS", "alive version=1.19 code=20");
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         browserMouse = prefs.getBoolean(KEY_MOUSE, true);
         AdBlock.enabled = prefs.getBoolean(KEY_ADBLOCK, true);
@@ -1352,6 +1356,7 @@ public class MainActivity extends Activity {
         loadResume();
         buildUi();
         setupWebView();
+        if (prefs.getBoolean(KEY_REMOTE, false)) startRemoteServer(); // v1.19
         showHome();
     }
 
@@ -1380,6 +1385,12 @@ public class MainActivity extends Activity {
         if (webView != null && currentScreen == browserPane && !browserSuspended) {
             try { webView.onResume(); webView.resumeTimers(); } catch (Exception ignored) {}
         }
+    }
+
+    @Override
+    protected void onDestroy() {
+        stopRemoteServer(); // v1.19
+        super.onDestroy();
     }
 
     @Override
@@ -2460,6 +2471,15 @@ public class MainActivity extends Activity {
             boolean on = !prefs.getBoolean(KEY_VIDEO_LOCK, true);
             prefs.edit().putBoolean(KEY_VIDEO_LOCK, on).apply(); refreshSettingsLabels();
         });
+        // v1.19: phone remote - a LAN web page (PIN-paired, max 2
+        // phones) that drives this browser: trackpad cursor, taps,
+        // navigation, URL entry, typing, volume and seek.
+        remoteBtnSettings = settingRow(pane, "Phone remote (control the browser from your phone)", v -> {
+            boolean on = !prefs.getBoolean(KEY_REMOTE, false);
+            prefs.edit().putBoolean(KEY_REMOTE, on).apply();
+            if (on) startRemoteServer(); else stopRemoteServer();
+            refreshSettingsLabels();
+        });
         // v1.7: OMDb key row - drives the scores half of RW poster
         // enrichment (posters themselves also load without a key).
         omdbBtnSettings = settingRow(pane, "OMDb API key \u2014 posters + IMDb/RT scores", v -> openOmdbKeyDialog());
@@ -2537,6 +2557,7 @@ public class MainActivity extends Activity {
         adblockBtnSettings.setText(prefs.getBoolean(KEY_ADBLOCK, true) ? "ON" : "OFF");
         cursorBtnSettings.setText(cursorStepLabel());
         if (videoLockBtnSettings != null) videoLockBtnSettings.setText(prefs.getBoolean(KEY_VIDEO_LOCK, true) ? "ON" : "OFF");
+        if (remoteBtnSettings != null) remoteBtnSettings.setText(prefs.getBoolean(KEY_REMOTE, false) ? "ON" : "OFF");
         if (appearanceBtnSettings != null) appearanceBtnSettings.setText(browserDark() ? "Dark" : "Light");
         if (omdbBtnSettings != null) omdbBtnSettings.setText(
                 prefs.getString(KEY_OMDB, "").trim().isEmpty() ? "Not set" : "Key saved");
@@ -2784,6 +2805,7 @@ public class MainActivity extends Activity {
             "\u2699 Browser Settings\u2026",
             fav ? "\u2605 Remove current page from Favorites"
                 : "\u2605 Add current page to Favorites",
+            "Phone remote\u2026",
             "\u2715 Done (close browser)",
         };
         AlertDialog d = new AlertDialog.Builder(dialogContext())
@@ -2797,7 +2819,8 @@ public class MainActivity extends Activity {
                         case 4: setBrowserMouse(!browserMouse, true); break;
                         case 5: openBrowserSettings(); break;
                         case 6: toggleFav(pageEntry); break;
-                        case 7: closeBrowser(); break;
+                        case 7: openRemotePanel(); break;
+                        case 8: closeBrowser(); break;
                         default: break;
                     }
                 })
@@ -2837,6 +2860,7 @@ public class MainActivity extends Activity {
             "Desktop user-agent: " + (prefs.getBoolean(KEY_DESKTOP_UA, false) ? "ON" : "OFF"),
             "Cursor speed: " + cursorStepLabel(),
             "Video scroll lock: " + (prefs.getBoolean(KEY_VIDEO_LOCK, true) ? "ON" : "OFF"),
+            "Phone remote\u2026",
             "Clear cache",
             "Clear history",
         };
@@ -2875,16 +2899,328 @@ public class MainActivity extends Activity {
                             prefs.edit().putBoolean(KEY_VIDEO_LOCK, on).apply();
                             refreshSettingsLabels(); break;
                         }
-                        case 7: webView.clearCache(true); Toast.makeText(this, "Cache cleared", Toast.LENGTH_SHORT).show(); break;
-                        case 8: webView.clearHistory(); Toast.makeText(this, "History cleared", Toast.LENGTH_SHORT).show(); break;
+                        case 7: ui.post(this::openRemotePanel); break; // v1.19: panel replaces the sheet (no reopen below)
+                        case 8: webView.clearCache(true); Toast.makeText(this, "Cache cleared", Toast.LENGTH_SHORT).show(); break;
+                        case 9: webView.clearHistory(); Toast.makeText(this, "History cleared", Toast.LENGTH_SHORT).show(); break;
                         default: break;
                     }
-                    ui.post(this::openBrowserSettings);
+                    if (which != 7) ui.post(this::openBrowserSettings);
                 })
                 .setNegativeButton("Close", null)
                 .create();
         trackDialog(d);
         d.show();
+    }
+
+    // ---------------------------------------------------------- v1.19: phone remote
+
+    private RemoteServer remoteServer;
+    private boolean remoteHeartbeatOn = false;
+    private String remoteNote; // one-shot note carried by the next state push
+    private TextView remotePairCountView; // live label inside the pairing panel, if open
+
+    private final Runnable remoteHeartbeat = new Runnable() {
+        @Override public void run() {
+            if (remoteServer == null) { remoteHeartbeatOn = false; return; }
+            pushRemoteState();
+            ui.postDelayed(this, 2500);
+        }
+    };
+
+    private void startRemoteServer() {
+        if (remoteServer != null) return;
+        remoteServer = new RemoteServer(this, ui, remoteHost);
+        remoteServer.start();
+        if (!remoteHeartbeatOn) {
+            remoteHeartbeatOn = true;
+            ui.postDelayed(remoteHeartbeat, 2500);
+        }
+        pushRemoteState();
+    }
+
+    private void stopRemoteServer() {
+        if (remoteServer == null) return;
+        remoteServer.stop();
+        remoteServer = null;
+    }
+
+    private void pushRemoteState() {
+        if (remoteServer == null) return;
+        try { remoteServer.broadcast(buildRemoteStateJson()); }
+        catch (Exception ignored) {}
+    }
+
+    private String buildRemoteStateJson() {
+        JSONObject o = new JSONObject();
+        try {
+            o.put("t", "state");
+            o.put("title", webView != null && webView.getTitle() != null ? webView.getTitle() : "");
+            o.put("url", webView != null && webView.getUrl() != null ? webView.getUrl() : "");
+            o.put("fs", fsLikeActive());
+            o.put("mouse", browserMouse);
+            o.put("browser", currentScreen == browserPane);
+            o.put("canBack", webView != null && webView.canGoBack());
+            o.put("canFwd", webView != null && webView.canGoForward());
+            o.put("paired", remoteServer != null ? remoteServer.sessionCount() : 0);
+            if (remoteNote != null) { o.put("note", remoteNote); remoteNote = null; }
+        } catch (Exception ignored) {}
+        return o.toString();
+    }
+
+    // Extra C: insert text into the page's focused editable element
+    // (top document, then same-origin iframes). Returns '1' on success.
+    private static final String REMOTE_TYPE_JS =
+            "(function(){try{"
+            + "function ins(doc){var el=doc.activeElement;if(!el)return false;"
+            + "var tag=(el.tagName||'').toLowerCase();"
+            + "if(tag!=='input'&&tag!=='textarea'&&!el.isContentEditable)return false;"
+            + "var text=%s;"
+            + "try{"
+            + "if(tag!=='input'&&tag!=='textarea'){doc.execCommand('insertText',false,text);}"
+            + "else if(el.setRangeText&&typeof el.selectionStart==='number'){"
+            + "el.setRangeText(text,el.selectionStart,el.selectionEnd,'end');}"
+            + "else{el.value+=text;}"
+            + "}catch(e){try{el.value+=text;}catch(e2){}}"
+            + "try{el.dispatchEvent(new Event('input',{bubbles:true}));}catch(e){}"
+            + "return true;}"
+            + "if(ins(document))return '1';"
+            + "var fs=document.querySelectorAll('iframe');"
+            + "for(var i=0;i<fs.length;i++){try{var d=fs[i].contentDocument;"
+            + "if(d&&ins(d))return '1';}catch(e){}}"
+            + "return '0';}catch(e){return '0';}})()";
+
+    // Extra C: Enter key on the focused element (best-effort form submit).
+    private static final String REMOTE_ENTER_JS =
+            "(function(){try{"
+            + "function fire(doc){var el=doc.activeElement;if(!el)return false;"
+            + "var types=['keydown','keypress','keyup'];"
+            + "for(var i=0;i<types.length;i++){"
+            + "var ev;try{ev=new KeyboardEvent(types[i],{key:'Enter',code:'Enter',bubbles:true,cancelable:true});}"
+            + "catch(e){ev=doc.createEvent('Event');ev.initEvent(types[i],true,true);}"
+            + "try{Object.defineProperty(ev,'keyCode',{value:13});"
+            + "Object.defineProperty(ev,'which',{value:13});}catch(e){}"
+            + "el.dispatchEvent(ev);}"
+            + "return true;}"
+            + "if(fire(document))return '1';"
+            + "var fs=document.querySelectorAll('iframe');"
+            + "for(var i=0;i<fs.length;i++){try{var d=fs[i].contentDocument;"
+            + "if(d&&fire(d))return '1';}catch(e){}}"
+            + "return '0';}catch(e){return '0';}})()";
+
+    // Extra D: seek the biggest playing (else first) <video> by N seconds.
+    private static final String REMOTE_SEEK_JS =
+            "(function(){try{"
+            + "function best(doc){var vs=doc.querySelectorAll('video');"
+            + "var bp=null,ba=-1,first=null;"
+            + "for(var i=0;i<vs.length;i++){var v=vs[i];if(!first)first=v;"
+            + "if(!v.paused){var r=v.getBoundingClientRect();var a=r.width*r.height;"
+            + "if(a>ba){ba=a;bp=v;}}}"
+            + "return bp||first;}"
+            + "var v=best(document);"
+            + "if(!v){var fs=document.querySelectorAll('iframe');"
+            + "for(var i=0;i<fs.length;i++){try{var d=fs[i].contentDocument;"
+            + "if(d){v=best(d);if(v)break;}}catch(e){}}}"
+            + "if(v){try{v.currentTime=Math.max(0,(v.currentTime||0)+(%d));}catch(e){}}"
+            + "}catch(e){}})()";
+
+    /**
+     * RemoteServer.Host: every callback arrives on the UI thread.
+     * Page commands are browser-gated (the state push tells phones
+     * when the browser is not open); volume is global.
+     */
+    private final RemoteServer.Host remoteHost = new RemoteServer.Host() {
+        @Override public void remoteMove(float dx, float dy) {
+            if (currentScreen != browserPane) return;
+            moveCursor(dx, dy); // gain applied server-side (trackpad feel)
+        }
+        @Override public void remoteTap() {
+            if (currentScreen != browserPane) return;
+            if (fsView != null) dispatchFsTap(cursorX, cursorY);
+            else dispatchTap(cursorX, cursorY);
+            if (fsLikeActive()) pokeFsCursor(); // a tap is interaction: un-fade + re-arm
+        }
+        @Override public void remoteLongTap() {
+            if (currentScreen != browserPane) return;
+            if (fsView != null) dispatchFsTap(cursorX, cursorY);
+            else dispatchLongTap(cursorX, cursorY);
+            if (fsLikeActive()) pokeFsCursor();
+        }
+        @Override public void remoteScroll(int dyRaw) {
+            if (currentScreen != browserPane) return;
+            float density = getResources().getDisplayMetrics().density;
+            doScrollBy(0, Math.round(dyRaw * density)); // clamps/freezes inside govern
+        }
+        @Override public void remoteBack() {
+            if (currentScreen == browserPane && webView != null && webView.canGoBack())
+                webView.goBack();
+        }
+        @Override public void remoteForward() {
+            if (currentScreen == browserPane && webView != null && webView.canGoForward())
+                webView.goForward();
+        }
+        @Override public void remoteReload() {
+            if (currentScreen == browserPane && webView != null) webView.reload();
+        }
+        @Override public void remoteDone() {
+            if (currentScreen == browserPane) closeBrowser();
+        }
+        @Override public void remotePlayPause() {
+            if (currentScreen != browserPane) return;
+            if (fsView != null) dispatchFsTap(fsCenterX(), fsCenterY());
+            else togglePlayJs();
+        }
+        @Override public void remoteUrl(String u) {
+            if (currentScreen != browserPane || webView == null) return;
+            loadResolved(u == null ? "" : u.trim()); // same normalization as the URL dialog
+        }
+        @Override public void remoteType(final String text) {
+            if (currentScreen != browserPane || webView == null
+                    || text == null || text.isEmpty()) return;
+            try {
+                webView.evaluateJavascript(
+                        String.format(REMOTE_TYPE_JS, JSONObject.quote(text)),
+                        value -> {
+                            boolean ok = value != null && value.contains("1");
+                            if (!ok) {
+                                remoteNote = "No text field focused on TV";
+                                pushRemoteState();
+                            }
+                        });
+            } catch (Exception ignored) {}
+        }
+        @Override public void remoteEnterKey() {
+            if (currentScreen != browserPane || webView == null) return;
+            try { webView.evaluateJavascript(REMOTE_ENTER_JS, null); }
+            catch (Exception ignored) {}
+        }
+        @Override public void remoteVolume(int dir) {
+            try {
+                AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+                if (am != null) am.adjustStreamVolume(AudioManager.STREAM_MUSIC,
+                        dir >= 0 ? AudioManager.ADJUST_RAISE : AudioManager.ADJUST_LOWER,
+                        AudioManager.FLAG_SHOW_UI);
+            } catch (Exception ignored) {}
+        }
+        @Override public void remoteSeek(int seconds) {
+            if (currentScreen != browserPane || webView == null) return;
+            try {
+                webView.evaluateJavascript(
+                        String.format(Locale.US, REMOTE_SEEK_JS, seconds), null);
+            } catch (Exception ignored) {}
+        }
+        @Override public void remoteSessionsChanged() {
+            if (remotePairCountView != null && remoteServer != null)
+                remotePairCountView.setText(
+                        "Phones paired: " + remoteServer.sessionCount() + " / 2");
+            pushRemoteState();
+        }
+    };
+
+    /** Pairing panel (TV side): address, QR, PIN, session controls. */
+    private void openRemotePanel() {
+        boolean on = remoteServer != null && remoteServer.isRunning();
+        LinearLayout box = new LinearLayout(dialogContext());
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(24), dp(8), dp(24), dp(4));
+        if (!on) {
+            box.addView(tv("Phone remote is OFF. Turn it on to control the browser "
+                    + "from a phone on the same Wi-Fi network. Pairing uses a "
+                    + "PIN shown here; the server is off by default.", 15, TEXT, false));
+            AlertDialog d = new AlertDialog.Builder(dialogContext())
+                    .setTitle("Phone remote")
+                    .setView(box)
+                    .setPositiveButton("Turn on", (dlg, w) -> {
+                        prefs.edit().putBoolean(KEY_REMOTE, true).apply();
+                        stopRemoteServer(); // clear any dead instance
+                        startRemoteServer();
+                        refreshSettingsLabels();
+                        ui.post(this::openRemotePanel);
+                    })
+                    .setNegativeButton("Close", null)
+                    .create();
+            trackDialog(d);
+            d.show();
+            return;
+        }
+        String ip = RemoteServer.localIpAddress(this);
+        final String url = "http://" + ip + ":" + RemoteServer.PORT;
+        box.addView(tv(url, 17, TEXT, true));
+        TextView alt = tv("or http://HeckYeah-TV.local:" + RemoteServer.PORT
+                + " (extra B: name resolution is reliable on iPhone; "
+                + "Android phones may need the IP address above)", 12, DIM, false);
+        alt.setPadding(0, dp(4), 0, 0);
+        box.addView(alt);
+        TextView pinView = tv("PIN  " + spacedPin(remoteServer.pin()), 30, TEXT, true);
+        pinView.setPadding(0, dp(14), 0, 0);
+        box.addView(pinView);
+        try {
+            Bitmap qr = renderQrBitmap(url, dp(220));
+            if (qr != null) {
+                ImageView iv = new ImageView(this);
+                iv.setImageBitmap(qr);
+                LinearLayout.LayoutParams lp =
+                        new LinearLayout.LayoutParams(dp(220), dp(220));
+                lp.gravity = Gravity.CENTER_HORIZONTAL;
+                lp.topMargin = dp(12);
+                box.addView(iv, lp);
+            }
+        } catch (Exception ignored) {}
+        remotePairCountView = tv("Phones paired: " + remoteServer.sessionCount() + " / 2",
+                14, DIM, false);
+        remotePairCountView.setPadding(0, dp(12), 0, 0);
+        box.addView(remotePairCountView);
+        AlertDialog d = new AlertDialog.Builder(dialogContext())
+                .setTitle("Phone remote")
+                .setView(box)
+                .setPositiveButton("Close", null)
+                .setNegativeButton("New PIN", (dlg, w) -> {
+                    if (remoteServer != null) remoteServer.regeneratePinAndDropSessions();
+                    ui.post(this::openRemotePanel);
+                })
+                .setNeutralButton("Disconnect all", (dlg, w) -> {
+                    if (remoteServer != null) remoteServer.dropAllSessions();
+                    ui.post(this::openRemotePanel);
+                })
+                .create();
+        d.setOnShowListener(x -> browserDialogDepth++);
+        d.setOnDismissListener(x -> {
+            if (browserDialogDepth > 0) browserDialogDepth--;
+            remotePairCountView = null;
+        });
+        d.show();
+    }
+
+    private static String spacedPin(String pin) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < pin.length(); i++) {
+            if (i > 0) sb.append(' ');
+            sb.append(pin.charAt(i));
+        }
+        return sb.toString();
+    }
+
+    /** Extra A: QR bitmap (dark modules on white, 4-module quiet zone). */
+    private Bitmap renderQrBitmap(String text, int px) {
+        QrCode qr = QrCode.encodeText(text);
+        int n = qr.size();
+        int quiet = 4;
+        int total = n + quiet * 2;
+        int scale = Math.max(1, px / total);
+        Bitmap bmp = Bitmap.createBitmap(total * scale, total * scale,
+                Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(bmp);
+        canvas.drawColor(Color.WHITE);
+        Paint paint = new Paint();
+        paint.setColor(Color.BLACK);
+        for (int y = 0; y < n; y++) {
+            for (int x = 0; x < n; x++) {
+                if (qr.getModule(x, y)) {
+                    canvas.drawRect((x + quiet) * scale, (y + quiet) * scale,
+                            (x + quiet + 1) * scale, (y + quiet + 1) * scale, paint);
+                }
+            }
+        }
+        return bmp;
     }
 
     private void applyUserAgent() {
@@ -2939,6 +3275,7 @@ public class MainActivity extends Activity {
                     browserTitle.setText(title);
                     updateResume(view.getUrl(), title, false); // v1.4: title refresh, any category
                     if (rwActive) updateRwSession(view.getUrl(), title);
+                    pushRemoteState(); // v1.19
                 }
             }
             // HTML5 fullscreen video (the big one for players):
@@ -2971,6 +3308,7 @@ public class MainActivity extends Activity {
                 pageProgress.setVisibility(View.VISIBLE);
                 setUrlPillText(url);
                 showHeader(true); // v1.4: every new page starts with the bar visible
+                pushRemoteState(); // v1.19
             }
             @Override public void doUpdateVisitedHistory(WebView view, String url, boolean isReload) {
                 super.doUpdateVisitedHistory(view, url, isReload);
@@ -2980,6 +3318,7 @@ public class MainActivity extends Activity {
                 // episode page gets recorded even when onPageFinished for
                 // it never happens (v1.0 missed these entirely).
                 if (rwActive) updateRwSession(url, view.getTitle());
+                pushRemoteState(); // v1.19
             }
             @Override public void onPageFinished(WebView view, String url) {
                 pageProgress.setVisibility(View.GONE);
@@ -2989,6 +3328,7 @@ public class MainActivity extends Activity {
                 updateResume(url, title, true); // v1.4: resume target = last finished page, any category
                 if (rwActive) { updateRwSession(url, title); maybeCaptureShot(url); }
                 maybeSeek();
+                pushRemoteState(); // v1.19
             }
         });
 
@@ -3119,6 +3459,7 @@ public class MainActivity extends Activity {
         if (cursorView != null) cursorView.bringToFront();
         updateCursorVisibility();
         pokeFsCursor(); // start the 10s idle fade (mouse sub-mode only)
+        pushRemoteState(); // v1.19
     }
 
     /**
@@ -3461,6 +3802,7 @@ public class MainActivity extends Activity {
         fsView = null; fsCallback = null;
         updateCursorVisibility();
         if (cb != null) try { cb.onCustomViewHidden(); } catch (Exception ignored) {}
+        pushRemoteState(); // v1.19
     }
 
     private void setUrlPillText(String url) {
@@ -3637,6 +3979,7 @@ public class MainActivity extends Activity {
             if ("cat".equals(originKind) && originCat != null) showCategory(originCat, null);
             else if ("search".equals(originKind)) showSearch();
             else showHome();
+            pushRemoteState(); // v1.19: phones see the browser is gone
         };
         // RW snapshot + playback position first (async JS), then finalize.
         if (rwActive) {

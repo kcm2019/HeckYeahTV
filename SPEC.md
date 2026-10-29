@@ -164,6 +164,49 @@ Selected: **Core + recommended extras A, B, D, E** plus a new feature:
   entries incl. VitePress `**bold**` recommended entries), caches
   to app-private storage, falls back to bundled seed on failure.
 
+## Phone remote (v1.19 — Core + A–E, all picked)
+
+A phone on the same Wi-Fi network controls the browser through a
+web page the app itself serves — no phone app to install.
+
+- **Core:** hand-rolled HTTP + WebSocket (RFC 6455) server on port
+  18765 (`RemoteServer`), off by default (Settings → "Phone
+  remote"), started/stopped with the toggle. Serves
+  `assets/remote.html`: trackpad (drag = cursor move with velocity
+  acceleration + app-side gain, tap = click, 500 ms hold =
+  long-press, two-finger drag = scroll), Back / Forward / Reload /
+  Play-Pause / Done buttons, a URL bar (same normalization as the
+  TV URL dialog), and live state pushes (title, URL, fullscreen,
+  mouse mode, browser-open, history availability) on navigation,
+  fullscreen/pseudo transitions, pairing changes, and a 2.5 s
+  heartbeat. All commands funnel into the same internals the
+  remote control uses (`moveCursor`, `dispatchTap`/
+  `dispatchFsTap`, `doScrollBy`, `loadResolved`, `togglePlayJs`,
+  `closeBrowser`), so every clamp and freeze applies unchanged.
+- **Pairing/security:** 4-digit PIN shown on the TV (regenerated
+  at every server start); POST /pair issues an in-memory session
+  cookie (max **2** phones — extra E), 5 failed attempts lock
+  pairing for 60 s. Tokens never touch storage: restarts re-pair.
+  The TV pairing panel (browser menu / browser settings →
+  "Phone remote…") shows address, PIN, QR, paired count, and
+  "New PIN" / "Disconnect all" controls.
+- **A. QR code** on the panel encoding the address (in-app QR
+  generator, ECC level M, verified standalone on a desktop JVM).
+- **B. mDNS:** the service is advertised as "HeckYeah TV"
+  (`_http._tcp.`) while the server runs; the panel also prints a
+  `HeckYeah-TV.local` address (name resolution is reliable on
+  iPhone; Android phones may need the IP).
+- **C. Type into page:** a phone text field inserts text at the
+  caret of the page's focused input/textarea/contenteditable
+  element (same-origin iframes included) and dispatches `input`;
+  an Enter button fires Enter key events at it. If nothing
+  editable is focused, the phone shows a note.
+- **D. Media keys:** volume up/down (`AudioManager`, needs
+  MODIFY_AUDIO_SETTINGS) and ±10 s seek of the biggest playing
+  (else first) `<video>` in the page.
+- New permissions (both normal): ACCESS_WIFI_STATE (display the
+  device's Wi-Fi address in the panel) and MODIFY_AUDIO_SETTINGS.
+
 ## Open choices
 
 1. App name: HeckYeah TV (proposed) / FMHY TV / FreeMedia TV?
