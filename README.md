@@ -22,9 +22,10 @@ in-app browser built for D-pad and mouse-style remote navigation.
 - Host-level ad/tracker and popup blocking, video-aware scroll
   clamping, and fullscreen diagnostics under the `HeckYeahFS` log tag
 - Phone remote: a web page served by the app lets a phone on the
-  same Wi-Fi act as a trackpad + browser controller (navigation,
-  URL entry, typing into the page, volume and seek), paired with
-  a PIN shown on the TV — see "Phone remote" below
+  same Wi-Fi control the whole app — an Apple TV Remote-style
+  page with a trackpad for the browser and a clickpad D-pad for
+  the menus — paired with a PIN shown on the TV — see
+  "Phone remote" below
 
 ## Requirements
 
@@ -61,14 +62,23 @@ adb shell monkey -p com.heckyeah.tv -c android.intent.category.LAUNCHER 1
 With **Settings → Phone remote** turned on, the app serves a
 control page on your local network at `http://<device-ip>:18765`.
 Open it in a phone browser (no app to install), enter the 4-digit
-PIN shown on the TV under **browser menu / browser settings →
-Phone remote…**, and the phone becomes a trackpad and browser
-controller: cursor movement, taps and long-presses, scrolling,
-Back / Forward / Reload / Play-Pause / Done, URL entry with the
-phone keyboard, typing into the focused field on the page,
-±10-second seek, and volume. The TV panel also shows a QR code
-for the address and the paired-phone count (up to 2), and can
-regenerate the PIN or disconnect all phones.
+PIN shown on the TV in the pairing panel (opened from **Home →
+Phone**, the browser toolbar's **Phone** button, or the browser
+menu — and, since v1.27, it also pops up by itself for 10
+seconds when the browser opens with no phone paired), and the
+phone becomes a full remote for the app. The page
+is styled after Apple's TV Remote app and switches modes
+automatically: in the browser it is a trackpad (cursor movement,
+taps and long-presses, scrolling, Back / Forward / Reload /
+Play-Pause / Done, URL entry with the phone keyboard, typing
+into the focused field on the page); everywhere else the same
+surface becomes a clickpad D-pad that drives the TV interface
+with synthesized remote keys — menus, Home, Search, Settings
+and dialogs included. A segmented control on the page can
+override the mode until the TV's screen next changes. ±10-second
+seek and volume work in both modes. The TV panel also shows a
+QR code for the address and the paired-phone count (up to 2),
+and can regenerate the PIN or disconnect all phones.
 
 Permissions used by this feature (both normal Android
 permissions): `ACCESS_WIFI_STATE` (to display the device's Wi-Fi
@@ -223,6 +233,997 @@ export KEYSTORE_PASS='change-me'
 export KEY_PASS="$KEYSTORE_PASS"
 ./build.sh   # → build/manual/apk/HeckYeah.apk
 ```
+
+## v1.32 (Oct 29, 2026) — remote text strip + fresh-page URL, 15s pairing card, self-healing cursor
+
+Three parts from Kurt: the remote-page texts he asked to remove
+were still on his phone, the pairing card's countdown goes from
+10s to 15s, and toggling the browser input mode from the nav-bar
+Mode button while a phone was connected killed the cursor until
+an app restart.
+
+- **(Part A) The remote text: really gone, and the phone is
+  forced to fetch the fresh page.** v1.31 verifiably deleted
+  `#modeCap`/`#footNote` and the server already sent
+  `Cache-Control: no-store` — yet the texts persisted on Kurt's
+  phone, because the pairing URL was identical for every build:
+  a phone tab restored from its snapshot/cache at the old address
+  can keep running the pre-update document while its WebSocket
+  reconnects and makes the stale page look alive. Two fixes.
+  (1) **Versioned pairing address:** the address shown in the
+  pairing panel and the pairing card, and the URL encoded in the
+  QR, is now `http://<ip>:18765/?v=<versionCode>` (the .local
+  alt address in the panel carries the same suffix), built by one
+  `remotePageUrl()` helper from the live package versionCode.
+  `RemoteServer` already strips the query string when routing,
+  and the page's WebSocket connects via `location.host`, so the
+  versioned URL routes and pairs exactly as before; the
+  `Cache-Control` header gains `must-revalidate` alongside
+  `no-store`. (2) **The last non-functional texts are removed:**
+  `#padHint` inside the trackpad surface ("Drag to move the
+  cursor…", and its menu variant "Swipe to move · tap to
+  select…") — element, CSS (`#padHint`, `#padHint.fade`), the
+  `fadeHint()`/`hintFaded` machinery and both call sites, and the
+  `applyMode()` writer — plus the two `.skipCap` divs ("Skip
+  back" / "Skip forward") and their CSS rule; the skip buttons
+  keep their `aria-label`s and `−10`/`+10` spans. The surfaces
+  are now completely text-free. Fit is structurally unchanged:
+  `#padHint` was absolutely positioned (no flex impact) and the
+  media row's height is set by the 120dp volume rocker, not the
+  skip captions, so the 100dvh budget is identical in both
+  modes, panels closed or open. Audit: zero live references to
+  any removed node, every `getElementById` target present in the
+  DOM, extracted script passes `node --check`. Kept as functional
+  labels: header brand + now-playing, the Trackpad/D-Pad
+  segmented labels, Back/Forward/Reload pill text, URL/Type chip
+  text, OK.
+- **(Part B) Pairing card countdown 10s → 15s.** One constant,
+  `PAIR_CARD_MS = 15000`: `startPairCardCountdown()` derives both
+  the "Closes in Ns" counter start (`PAIR_CARD_MS / 1000`) and
+  the progress-drain animator's duration from it, and that method
+  is the single funnel for the show path and every restart
+  (including the turn-on inside the card via `pairCardAction()`),
+  so all paths count from 15. The manual pairing panel has no
+  countdown and gains none. The unrelated 10s fullscreen cursor
+  fade is untouched.
+- **(Part C) Self-healing cursor.** Analysis of the old code:
+  `updateCursorVisibility()` — the only show/hide gate — set
+  visibility but never alpha; the fullscreen idle fade is the
+  cursor's only alpha writer, and both of its restore paths
+  (`pokeFsCursor`, `cancelFsFade`) are conditional on the
+  `cursorFaded` flag, so any divergence between that flag and the
+  view's real alpha (an animator completing or being cancelled
+  across a mode/dialog/pairing transition) left a VISIBLE view at
+  alpha 0 with no path back — `moveCursor` only calls
+  `pokeFsCursor`, which no-ops when the flag is false.
+  `setBrowserMouse(true)` — the exact transition in Kurt's
+  report — neither cancelled a fade animation nor restored alpha.
+  And the phone-connected transitions (`remoteSessionsChanged`,
+  dialog show/dismiss, pairing card show/hide) never re-asserted
+  the cursor at all. Fix: one `refreshCursor(why)` recomputes
+  visibility from (browser current && mouse mode); when the
+  cursor should show it forces VISIBLE, cancels any stray alpha
+  animation and restores alpha 1 — unless the fsLike idle fade
+  legitimately owns the alpha (`fsLikeActive() && cursorFaded`) —
+  re-asserts decor z-order (cursor above content/fsContainer,
+  feedback flash back on top), and invalidates; when it should
+  hide, GONE. It is called from `setBrowserMouse` (both
+  directions), `showScreen`, `remoteSessionsChanged`, every
+  `trackDialog` show/dismiss transition, pairing card show/hide,
+  and `showFullscreen`/`hideFullscreen` (the four sites that
+  previously called `updateCursorVisibility`, which now delegates
+  to it). A watchdog at the top of `moveCursor()` — the funnel
+  for D-pad movement and the phone's `remoteMove` — heals on the
+  spot if the cursor should be visible but is GONE or
+  alpha-faded outside a legitimate fade. HeckYeahFS logs only on
+  change or rescue: `cursor show/hide/rescue why=<reason>`.
+
+## v1.31 (Oct 29, 2026) — remote text cleanup + layered play/pause
+
+Two parts from Kurt: the phone remote still carried explanatory
+text he didn't want, and "Play and Pause on a regular remote and
+the website remote still does not work."
+
+- **(Part A) Remote page text removals (remote.html).** The mode
+  caption element (`#modeCap` — "TRACKPAD — BROWSER",
+  "TRACKPAD — MENU · SWIPE TO NAVIGATE", "D-PAD — MENU") and the
+  bottom footnote element (`#footNote` — in D-pad mode: "Flick,
+  tap, or hold a direction on the clickpad to navigate the TV…")
+  are **deleted outright**: DOM nodes, CSS rules (including the
+  short-screen footnote rule) and every JS writer
+  (`applyMode()` no longer touches either). The freed rows
+  collapse through the flex layout, so the surface absorbs the
+  space and the 100dvh fit math is unchanged in both modes. The
+  in-surface trackpad hint (`#padHint`) stays. An audit confirms
+  zero remaining `modeCap`/`footNote` references and zero
+  `getElementById` calls pointing at missing nodes, so mode
+  switches both ways are error-free by construction; the page
+  script still passes `node --check`.
+- **(Part B) Play/pause rebuilt as ONE layered path.** Both
+  entry points — the physical remote's `MEDIA_PLAY_PAUSE` in
+  browser mouse **and** D-pad sub-modes, and the phone remote's
+  playpause command — now call the same `togglePlayPause(src)`.
+  Diagnosis of the old path: the toggle JS itself was already
+  ES5 (the audit found no arrow functions / let / const /
+  template literals / optional chaining; the guarded Promise
+  `.catch` access is ES5-valid and non-load-bearing), so syntax
+  wasn't the killer — the flow was: anything fullscreen-like
+  (including pseudo-FS) short-circuited straight to the injected
+  media key, which a WebView largely ignores for cross-origin
+  embeds like atlantic.st's player; the mouse-mode key handler
+  had **no repeat guard**, so a held key could toggle twice and
+  look like a no-op; and D-pad **toolbar focus swallowed
+  `MEDIA_PLAY_PAUSE` entirely**. The new layers, in order:
+  **L1** — ES5 JS toggle (top document + recursive same-origin
+  iframes; pause the largest playing / play the largest paused;
+  structured `none:seen=N,xframes=M` when nothing is reachable).
+  **L2** — a JS-dispatched `click()` on that same largest video,
+  for players that only honor their click handler. **L3** — a
+  **real injected tap** at the video's center through the
+  existing Instrumentation path (a genuine touch reaches a
+  cross-origin player's own handlers, like tapping with the
+  cursor): the point is the fresh (<2s) poll rect's center —
+  the poll now also stores the video's CSS *viewport* rect, and
+  the conversion is `center × webView.getScale()` + the
+  WebView's window offset, the scroll-lock conversion — or the
+  WebView center while fullscreen-like; it **never** taps after
+  L1/L2 landed, and never taps blindly with no known target.
+  **L4** — the existing media-key injection fallback. Real
+  fullscreen keeps its existing behavior (the L4 key lands in
+  `handleFullscreenKey` as the center tap). Anti-double-fire:
+  callers ignore `repeatCount > 0` (new in mouse mode) and the
+  shared function has a ~300ms re-entry guard. Logging under
+  `HeckYeahFS` at every step: `playpause src=key|phone`, each
+  layer's result verbatim (`playpause L1 js result=…`,
+  `L2 click result=…`, `L3 tap result=tap x=… y=…` /
+  `skip:no-target`, `L4 mediakey result=inject`), exactly one
+  final `playpause via=js|click|tap|mediakey|none` (the tap
+  line carries its coordinates), and a ~450ms post-action probe
+  (`playpause post src=… via=… state=playing|paused|none`) from
+  a dedicated ES5 state script that — unlike the playing-only
+  poll — can name the paused state. The v1.26 center feedback
+  flash keeps its rule on the new path: the JS layer flashes
+  its known result immediately; click/tap/mediakey flash only
+  when the post probe provably names the new state (silent when
+  indeterminable, and in real fullscreen). All page JS in this
+  path is strict ES5 and was extracted from the built source
+  and passed `node --check`. Seek/volume/nav paths untouched.
+- Manifest versionCode **32** / versionName **1.31**;
+  `alive version=1.31 code=32`.
+
+Build verification (build-verified only; the removals and the
+layered toggle — especially L3 against atlantic.st's player —
+are device-test-only):
+
+- `aapt2 dump badging`: `com.heckyeah.tv` versionCode
+  **32** / versionName **1.31**, sdk 25 / target 25.
+- APK: 611,560 bytes, sha256
+  `ce74bb0d5580abbd2e5f552c61e6ef65c4cac2c6ce0ba01acaa00fb6cc9eaabf`.
+- `apksigner verify`: OK; signer certificate SHA-256
+  `220529f9…b92fab5` (unchanged signing key).
+- `unzip -t`: no errors; the APK's `assets/remote.html` is
+  byte-identical to the source file.
+- Remote page script extracted and passed `node --check`;
+  the three play/pause page scripts (L1/L2/state probe)
+  extracted and passed `node --check` with no non-ES5 tokens.
+
+## v1.30 (Oct 29, 2026) — centered nav icons + arrow tips verified in a real render
+
+Two fixes from Kurt's on-device look at v1.29: "icons are shifted
+left of where they should be, please center them" and (caps his)
+"FIX ARROW TIPS FOR RELOAD AND FAST FORWARD AND REVERSE".
+
+- **Centering — root cause, not a nudge.** Every toolbar icon
+  rode on its control as a LEFT compound drawable of a `Button`
+  with empty text. `TextView.onDraw` draws that drawable at
+  `x = mPaddingLeft + getHorizontalOffsetForDrawables()` — and
+  the offset is 0 for Button/TextView — so the 30dp glyph was
+  pinned to the left edge of every slot: 9dp left of center in
+  the 48dp segments, 7dp in Done's 44dp, 5dp in Reload's 40dp
+  (`Gravity.CENTER` only centers the zero-width text). The
+  controls are now `FrameLayout`s holding one `Gravity.CENTER`
+  `ImageView` child — the glyph canvas center coincides with the
+  slot center exactly (0.0dp) for all 8 stops, verified by a
+  layout-true composite render. Second defect in the same
+  report: the v1.29 bar centered the address capsule with two
+  equal-weight spacers, but the flanks are unequal (left cluster
+  109dp, right cluster + Done 216dp), parking the capsule ~53dp
+  left of screen center at 1080p. The bar is now a `FrameLayout`:
+  nav cluster pinned left, capsule at `Gravity.CENTER`, right
+  cluster + Done pinned right — capsule center = bar center,
+  exactly. The Back/Forward chevron geometry also moved +0.02
+  (0.64/0.36) so its ink bounding box is exactly canvas-centered.
+- **Arrow tips — third pass, verified in a REAL render.** The
+  v1.28 "verified" heads were checked with a PIL approximation
+  of the SVGs; CairoSVG renders of the actually-shipped markup
+  show what Kurt saw: the arc ran UNDER a head narrower than
+  ~1.4x the stroke, rendering as a thorn/kite. All four
+  circular-arrow icons (TV toolbar Reload, the TV center
+  feedback ±10 pair, the phone Reload, the phone skip pair) are
+  rebuilt on one construction, checked in real renders before
+  porting (CairoSVG for the exact remote.html markup; faithful
+  PIL replication of the exact Canvas calls for the Java icons):
+  the arc is drawn only as far as the head's BASE CENTER, and a
+  filled triangular head grows out of that point — tip on the
+  circle at the leading end, base corners radial at ±0.19–0.29
+  of the radius (base ≈ 2–2.4x the stroke). The phone SVGs now
+  use explicit arc paths + polygons (no dasharray/rotate tricks);
+  the feedback glyphs lose their tip-overshoot kite; seek
+  intervals and labels stay ±10.
+
+## v1.29 (Oct 29, 2026) — studio redesign of the browser nav bar
+
+Kurt's verdict on the v1.28 bar, with a TV photo: "The nav bar UI
+looks like ass. Make it look like a design studio actually made
+this." The v1.27/28 bar was a full-width opaque blue-gray slab,
+every control isolated in its own outlined circle ("soap
+bubbles") at the same visual weight, a huge mostly-empty URL
+pill, Done as a flat tomato-red disc, and the page title on its
+own strip inside the slab, so the header read as two stacked
+bars. This version replaces the slab with ONE floating glass bar
+and changes nothing else: same 8 stops, same order, same actions.
+
+- **Floating glass, not a slab.** The header block is now just a
+  transparent positioning frame, inset 20dp at the sides and 12dp
+  at the top. The bar's elements carry a translucent vertical
+  gradient (lighter at the top edge — the fake-glass sheen), a
+  1dp hairline border, 20–22dp corner radii, and a soft elevation
+  shadow. API 25 has no blur (no RenderEffect/RenderScript), so
+  translucency + gradient + shadow is the whole trick. Dark
+  appearance = graphite glass (~rgba(24,25,29,0.88), border
+  rgba(255,255,255,0.14), text #F5F5F7, secondary #A1A1A6);
+  light = porcelain glass (~rgba(248,248,250,0.92), border
+  rgba(0,0,0,0.08), text #1D1D1F, secondary #6E6E73). Both were
+  mock-verified over dark and bright backgrounds.
+- **Integrated clusters; buttons lost their circles.** LEFT: one
+  segmented capsule, Back | hairline divider | Forward. RIGHT:
+  one segmented capsule, Mode | Phone | Gear. Segments are
+  48×44dp slots with NO background at rest; focus/hover paints a
+  translucent highlight + 2dp accent ring inset inside the
+  cluster (never clipped, no layout shift). Accent blue still
+  appears only where it means something (paired Phone, focus).
+- **Address capsule with the title inside.** The center capsule
+  (460×56dp) shows the host at 15sp semibold with the page title
+  as an 11sp secondary second line under it — the separate title
+  strip under the bar is deleted, so the header is one ~64dp row
+  instead of two stacked bars. Reload is a Safari-style ghost
+  inside the capsule's trailing edge (its own focus highlight is
+  a circular ghost ring). The capsule itself is the URL focus
+  stop; the full-URL editor behavior is unchanged.
+- **Done, restrained.** A red-TINTED glass circle (~20% #FF453A
+  fill, hairline red-tinted border, red ✕) in the same material
+  family as the clusters; focus strengthens the fill to ~35% and
+  rings it solid red. No more flat solid disc.
+- **Behavior frozen.** Same `toolbarViews` order [Back, Forward,
+  URL, Reload, Mode, Phone, Gear, Done], same clicks, tooltips
+  (they already fall below the bar; mouse hover now hit-tests in
+  reverse so Reload wins over the capsule that contains it),
+  Back/Forward dimming, Phone paired tint, Mode icon swap,
+  header hide/show, URL editor. The pairing card still anchors
+  10dp below the header block; the unmeasured-height fallbacks
+  were updated for the slimmer header (88dp bar, 90dp card).
+- **Verification:** the design was prototyped as a full-width
+  PIL mock (real Inter, v1.28 glyph geometry) over dark-video
+  and bright backgrounds in both appearances plus a focus-state
+  strip, read back and judged at full size and at 960px
+  (TV-photo distance); one iteration widened the segments
+  44→48dp and the capsule 440→460dp to fix the cluster/capsule
+  balance before any Java was written. Manifest versionCode
+  **30** / versionName **1.29**; `alive version=1.29 code=30`.
+
+## v1.28 (Oct 29, 2026) — themed pairing card + redrawn toolbar icons + remote arrow audit + unified remote controls
+
+Four parts, all from Kurt's v1.27 TV photo and follow-ups.
+
+- **(Part 1) The auto pairing popup is now a themed in-window
+  CARD.** The v1.27 auto variant of the pairing dialog — stock
+  gray, off-theme — is gone. In its place, a card built into
+  the browser pane (above the WebView, below the cursor
+  overlay), anchored **top-right, 10dp below the header block,
+  20dp off the right edge, ~430dp wide**, in the app's own dark
+  glass: browser-chrome color at ~92% alpha, 18dp radius, 1dp
+  hairline border, Inter, accent highlights; the light browser
+  appearance gets the light-chrome equivalent. Server on:
+  "PHONE REMOTE" label, "Pair your phone", the address in
+  monospace, the PIN as large bold accent spaced digits, and
+  the QR at ~104dp in a white rounded tile. Server off:
+  "Phone remote is off" + "Tap this card or press OK to turn
+  it on". A 3dp accent progress track under the content
+  **drains full → 0 over the 10 seconds**, with a "Closes in
+  Ns" line. Slide+fade in from the right (~240ms), out ~180ms.
+  Because the card is a plain view — not a dialog window — it
+  cannot disturb a playing video's surface (no videokick class,
+  no browserDialogDepth involvement). Interaction: a tap that
+  lands on the card runs the card action (off → turn the remote
+  on, rebuild to the on-state, restart the full 10s; on → open
+  the full manual pairing panel and hide the card); a tap
+  anywhere else dismisses the card without being consumed. In
+  D-pad mode, CENTER/OK performs the card action and BACK
+  dismisses it — both intercepted at the activity key level
+  while the card is visible, since the card is non-focusable
+  by design. Trigger/lifecycle semantics carry over from
+  v1.27 unchanged: once per browser session, ~700ms after
+  browser entry, only with 0 phones paired, flag consumed at
+  fire time, re-validated at fire time; a phone pairing while
+  it's up swaps it to "Phone connected ✓" and slides it out
+  ~800ms later; it hides on countdown end, screen change,
+  fullscreen entry, Done, any dialog opening, and manual panel
+  opening. The v1.27 auto-dialog machinery (auto variant of
+  openRemotePanel, its countdown footer, the identity-checked
+  clear funnel) is removed; the manual panel is byte-for-byte
+  the v1.26 behavior for its existing callers. Toolbar
+  tooltips are suppressed while the card is up (it takes the
+  place of the old dialog-depth clause).
+- **(Part 2) Toolbar icons redrawn to SF Symbols discipline.**
+  Kurt's photo verdict on v1.27's set: too thick, and the gear
+  read as a sun/asterisk. All eight `strokeIcon` kinds were
+  redrawn — strokes ~0.07–0.075 of the canvas (was 0.13–0.15),
+  glyph ~70% of the canvas, round caps/joins — and the
+  geometry was **verified before porting** by rendering the
+  identical numbers in a Python/PIL prototype at button scale
+  (2 iterations). Back/Forward are single tall narrow chevrons
+  ((0.62, 0.18) → (0.34, 0.50) → (0.62, 0.82), stroke 0.075).
+  Reload: thinner 300° arc (stroke 0.07, butt cap) + a compact
+  filled head — tip exactly at the arc endpoint (288°), base
+  0.38·r back along the arc, corners radial. Gear: the
+  prototype picked the **dashed-ring construction** — 8 arc
+  segments of 20° on r=0.395 with a 0.13 stroke (band
+  0.33–0.46) over a stroked ring r=0.295 and a filled hub
+  r=0.095 — over trapezoid teeth (which rendered as a sun);
+  it unmistakably reads as a gear at 48dp. Mouse: slimmer body
+  (0.072), short wheel dash, butt-capped inset divider (the
+  old round-cap divider poked nubs outside the body). D-pad:
+  one plus-outline path + filled center dot. Phone: slimmer
+  outline, smaller speaker dash + home dot. Done ✕ at 0.09,
+  still tinted red by the caller. All tint/state machinery
+  (paired accent, nav dimming, appearance retint, Mode swap)
+  is unchanged in behavior.
+- **(Part 3) Full arrow audit of the phone remote page
+  (remote.html).** Every arrow-bearing icon was re-prototyped
+  in PIL at display scale (1 iteration — the construction
+  discipline below rendered correct on the first sheet after
+  the v1.26 kite failure was diagnosed). **Circular arrows**
+  (skip pair + nav Reload): the v1.26 head was a kite — apex
+  overshooting the arc endpoint by ~8.5 units along the
+  tangent, base straddling the circle, and the base sitting
+  over the GAP instead of the swept arc. New construction
+  (SF-style): the arc is drawn UP TO the endpoint (butt end),
+  the head's **tip is exactly the endpoint**, its base center
+  sits on the circle a head-length before it (0.30·r for the
+  skips, 0.32·r for Reload), and the base corners step
+  radially ±0.30·head-length, so the arc visibly thickens
+  into a crisp point. Skip glyphs: dash re-anchored
+  (rotate 28.5°) so the arc *ends* at the head (309.5°,
+  top-right for forward, mirrored for back), gap upper side,
+  −10/+10 labels clear of the head. Reload: 270° arc as an
+  explicit path (start at 30°, end at 300°), gap upper-right,
+  head at the top end with a right-and-slightly-down tangent.
+  **Chevrons** (clickpad ×4, nav pills ×2, round-Back
+  chevron-in-rect): re-proportioned tall-and-narrow to the
+  same SF fractions as the TV set (stroke ratio stays 1.8/24
+  ≈ 0.075), points verified unclipped inside their viewBoxes.
+  Audited and left alone: play/pause (not an arrow), Menu
+  hamburger, Done ✕ (tips verified inside the viewBox), the
+  URL globe and Type keyboard chips (no arrowheads), volume
+  +/−, the PIN sheet. Buttons, sizes and commands are
+  identical — only icon geometry changed; the page script
+  still passes `node --check`.
+- **(Part 4) The phone remote's bottom controls are unified
+  across modes.** Everything below the surface is now
+  identical in trackpad and D-pad modes: the round row is
+  [Back] [Play/Pause] [Menu] **[Done]** in both (Done was
+  trackpad-only), the nav pill row (Back/Forward/Reload)
+  shows in D-pad mode too (its disabled states still follow
+  the canBack/canFwd state pushes — on menu screens they
+  honestly read disabled), and the URL/Type launcher chips +
+  Dock-zoom panels show and behave the same in D-pad mode.
+  The media cluster (skip circles + volume rocker) was
+  already shared and is pixel-identical. Only the surface
+  (trackpad vs clickpad), the segmented control and the
+  caption/hint still differ between modes. TV-side command
+  safety was verified, not assumed: `remoteDone`,
+  `remoteBack`, `remoteForward` and `remoteReload` were
+  already browser-gated clean no-ops off-browser — unchanged.
+  Two gaps were fixed: `remoteUrl` no longer drops the
+  command off-browser — from a menu screen it now **opens
+  the browser** on the resolved address (the URL-dialog
+  normalization was factored out and shared); `remoteType`
+  off-browser now answers with the "No text field focused on
+  TV" note instead of silence. Fit-to-screen: the D-pad row
+  set is now literally the trackpad row set, so the v1.25
+  flex math carries over unchanged — at a 667px viewport the
+  surface gets ~215px with panels closed, and an open panel
+  takes its height from the surface; the page total stays
+  exactly 100dvh.
+- Manifest versionCode **29** / versionName **1.28**;
+  `alive version=1.28 code=29`.
+
+Build verification (build-verified only; the card's feel, the
+redrawn icons at TV distance, the remote arrows and the
+unified D-pad layout are device-test-only):
+
+- `aapt2 dump badging`: `com.heckyeah.tv` versionCode
+  **29** / versionName **1.28**, sdk 25 / target 25.
+- APK: 607,464 bytes, sha256
+  `eac96fea6213ac32445ac10ba55f0ce47587129953bfdd69e2f7005af665d06f`.
+- `apksigner verify`: OK; signer certificate SHA-256
+  `220529f9…b92fab5` (unchanged signing key).
+- `unzip -t`: no errors; the APK's `assets/remote.html` is
+  byte-identical to the source file.
+- Remote page script extracted and passed `node --check`.
+
+## v1.27 (Oct 29, 2026) — auto pairing popup + browser toolbar redesign
+
+- **Auto pairing popup (replaces the v1.20 hint bubble).** The
+  small "tap Phone" tooltip is retired. Now, when a browser
+  session starts and no phone is paired, the pairing panel
+  itself opens automatically ~700ms after the browser appears,
+  with a **10-second auto-dismiss countdown** shown in a footer
+  line inside the panel ("Closes automatically in Ns"). Tapping
+  **Turn on** (or New PIN / Disconnect all) inside the popup
+  re-opens the panel and restarts the countdown at a full 10s,
+  so you always have time to read the address and PIN. If a
+  phone pairs while the popup is up, the countdown stops, the
+  footer flashes "Paired!", and the panel closes ~800ms later.
+  A manually opened panel (Phone button, Home, browser menu)
+  never gets a countdown. The popup fires at most once per
+  browser session; the session flag is consumed even if the
+  popup is suppressed at fire time (fullscreen or a dialog
+  already up), so it never appears late. Toolbar tooltips stay
+  suppressed while it is open via the existing rule that hides
+  them under any tracked dialog.
+- **Browser toolbar redesigned.** The bar is now three
+  sections in one row. **Left:** Back and Forward as circular
+  icon buttons. **Center** (held screen-centered by equal
+  spacers): the URL pill, shortened to a fixed ~300dp, showing
+  **only the site's host** (e.g. `atlantic.st`) — the URL
+  editor still opens with the full URL — with the Reload
+  circle right next to it. **Right:** Mode, Phone, Settings and
+  Done circles. All buttons are full circles (Back/Forward
+  52dp, Reload 50dp, right cluster 48dp) with bigger
+  custom-drawn icons (~26–28dp glyphs on a 30dp canvas,
+  extending the v1.25 canvas-icon helper): bold chevrons for
+  Back/Forward, an arc-and-arrowhead Reload, a toothed gear
+  for Settings, and Mode/Phone keeping their v1.25 glyphs at
+  the new size. Back/Forward icons now dim when that direction
+  is unavailable. **Done** has no text: a red ✕ (#FF453A) on a
+  translucent-red circle in both dark and light appearances,
+  with a solid-red ring when focused. D-pad toolbar order,
+  hover/focus name tooltips, paired-state Phone tint, Mode
+  icon semantics and the header auto-hide are unchanged.
+
+## v1.26 (Oct 29, 2026) — center action feedback animation + fixed skip glyphs
+
+- **(G) Center-screen action feedback (TV side).** A seek
+  (±10s) or a play/pause toggle in the browser now flashes a
+  big glyph in the center of the screen, YouTube-style: a
+  92dp decor-level `ImageView` (black circle at ~55% alpha,
+  white glyph drawn at runtime into a bitmap — play triangle,
+  pause bars, or a circular arc arrow with −10/+10) that
+  scales/fades in over ~120ms, holds ~350ms, and fades out
+  over ~300ms; retriggering swaps the glyph and restarts via
+  a generation counter, and leaving the browser cancels it.
+  Because the view lives at the decor level it renders the
+  same over the inline browser, real fullscreen and
+  pseudo-fullscreen. Hooks are the shared paths, so both
+  remotes get it: the phone's seek command flashes its icon
+  immediately with the command, and the v1.25 play/pause
+  toggle flashes the *resulting* state — the JS path knows it
+  directly (`js-paused` → pause icon, `js-played` → play);
+  the mediakey fallback samples the video poll ~450ms after
+  the key (retrying once if no poll has landed yet) and
+  flashes only when the playing state provably flipped —
+  inconclusive means no icon, never a guessed one (in real
+  fullscreen the poll is cleared by design, so that path
+  stays silent).
+- **(H) Phone skip glyphs rebuilt (remote.html).** The
+  v1.24 hand-computed arc paths rendered with the arrowhead
+  floating detached at the top. The glyph is now a `<circle>`
+  with `stroke-dasharray` (r 15.5 in a 48 viewBox,
+  circumference ≈ 97.4; dash "76 21.4" = a 280.9° arc with
+  the gap rotated to center at the top) plus an arrowhead
+  triangle inside a `<g>` rotated about the center to the
+  arc-end angle, drawn pointing along the tangent so the
+  rotation aligns it exactly — no hand-computed tangent
+  coordinates anywhere. The back glyph is the forward glyph
+  mirrored (`translate(48,0) scale(-1,1)`), so the two are
+  symmetric by construction; the −10/+10 labels are HTML
+  spans outside the SVG and are never mirrored. Geometry
+  verified numerically (arc-end −50.45°, head direction
+  39.55° = the exact clockwise tangent there). Button size,
+  glass style, captions and seek commands unchanged.
+
+## v1.25 (Oct 29, 2026) — toolbar icons + tooltips, menu-swipe trackpad, fit-to-screen remote page, play/pause reliability, Dock-style URL/Type panels
+
+Six parts, from a screenshot review round of the phone remote:
+
+- **(A) Browser toolbar icons + tooltips (TV side).** The Mode
+  and Phone toolbar buttons are icons now, drawn at runtime on a
+  Canvas (`strokeIcon`: mouse = rounded-rect body + wheel dash +
+  top-third line; D-pad = cross of two rounded rects + center
+  circle; phone = tall rounded rect + speaker dash + home dot) —
+  font glyphs for these are not trustworthy on Fire OS. The Mode
+  icon follows the old text label's rule exactly: it shows the
+  CURRENT sub-mode. Tinting is a `PorterDuff SRC_IN` color
+  filter on the bitmap drawable, so `refreshPhoneBtn()`'s paired
+  accent now drives the Phone icon (Home's text Phone button is
+  unchanged), and dark/light chrome re-tints via
+  `updateModeBtn()` / `refreshPhoneBtn()`. A single name bubble
+  (pairTip's visual family, child of the browser pane root above
+  the WebView, below the cursor overlay) names the toolbar
+  element under attention — Back / Forward / URL / Reload /
+  Mouse-or-D-pad / Phone / Settings / Done. Mouse hover hit-tests
+  the cursor against the toolbar rects in `moveCursor()` with a
+  350 ms dwell; D-pad toolbar focus schedules it at 150 ms from
+  `styleToolbarFocus()`. It hides on any tap, dialog open,
+  fullscreen, header hide, or leaving the browser, and never
+  stacks with the pairTip. Position: centered on the element,
+  clamped in the pane, above it when there's room — the toolbar
+  sits at the screen's top edge, so in practice it lands just
+  below the element.
+- **(B) Trackpad-on-menus swipe navigation (phone page + one TV
+  branch).** When the page is in trackpad mode but the TV is not
+  in the browser (trackpad manually picked on Home / Search /
+  Settings / category screens), the surface stops driving a
+  cursor and navigates like the Apple TV Remote's touch surface:
+  drags feed step accumulators — every 48 px along the dominant
+  axis (recomputed per segment) fires one `{"t":"key"}` step and
+  is subtracted, so a long drag walks several tiles and a flick
+  fires one; a tap sends `ok`; two-finger vertical scroll steps
+  up/down with the same accumulator (fingers down = step up,
+  matching the browser scroll convention). The caption reads
+  "TRACKPAD — MENU · SWIPE TO NAVIGATE" and the surface hint
+  swaps to "Swipe to move · tap to select / Hold for
+  long-press". TV side: `remoteLongTap` off-browser now injects
+  a long DPAD_CENTER (new `injectKeyHold`, ~600 ms hold through
+  the v1.23 instrumentation path, dispatch fallback kept), so
+  Home tiles open their long-press menus; in-browser longtap is
+  unchanged. When the TV returns to the browser, the same
+  surface drives the cursor again — context is evaluated per
+  state push, no reload.
+- **(C) The remote page fits the screen — no scrolling, ever.**
+  `html, body` are height 100% with overflow hidden; the body is
+  a flex column at `100dvh` (100vh fallback) where every row is
+  `flex: 0 0 auto` except the surface (`flex: 1 1 auto`,
+  min-height 150 px, fixed aspect ratio dropped) — the surface
+  absorbs all slack. Section gaps tightened to 10 px; a
+  max-height 700 px media query compacts round buttons to 48 px,
+  skip circles to 52 px, the rocker to 104 px and bars to 40 px,
+  and under 620 px the footnote line is hidden. Flex math at a
+  667 px-tall viewport (panels closed, conservative non-media
+  numbers): 504 px of fixed rows + gaps leaves a ~163 px
+  surface; with the short-screen query active at that height
+  the fixed rows shrink to ~452 px and the surface is ~215 px.
+- **(D) Play/Pause works first tap, every time.** Phone side:
+  the button is press-bound like the volume halves (fires on
+  touchstart/mousedown, 700 ms timestamp guards against the
+  trailing synthetic click, bare click kept for keyboard /
+  assistive use) instead of a bare click that a shifting page
+  could swallow. TV side: one shared toggle for the phone
+  command AND the physical media keys (`togglePlayJs`). The JS
+  scan recurses the top document + same-origin iframes (the
+  video poll's approach): pause the largest PLAYING video
+  (`js-paused`) or play the largest paused one (`js-played`)
+  among visible rects ≥ 160×90. If the scan finds nothing —
+  the player lives in a cross-origin iframe — or the browser
+  is in (pseudo-)fullscreen where the scan is blind, the
+  fallback injects `KEYCODE_MEDIA_PLAY_PAUSE` through the
+  instrumentation path; a one-shot flag in `dispatchKeyEvent`
+  lets that one key fall through to the WebView (Chromium's
+  media-session handling reaches cross-origin players) instead
+  of looping back into the toggle, and in real fullscreen it
+  lands in `handleFullscreenKey`'s center tap as before. Each
+  press logs one line: `playpause via=js-paused | js-played |
+  mediakey | none`.
+- **(E) Menu is a round button; the D-pad Menu pill is gone.**
+  The full-width "☰ Menu" pill row is deleted. Menu is now a
+  56 px round glass button (☰ inline SVG) in the round row:
+  [Back] [Play/Pause] [Menu] in D-pad mode, [Back] [Play/Pause]
+  [Menu] [Done] in trackpad mode (added there — in the browser,
+  MENU opens the browser nav menu). Same `{"t":"key","k":"menu"}`
+  command.
+- **(F) URL / Type bars collapse into Dock-style launchers
+  (trackpad mode).** The two always-visible bars are replaced by
+  one launcher row of two glass chips — globe "URL" and keyboard
+  "Type" (inline SVGs). Tapping a chip pulses it (scale 1 →
+  1.12 → 1, 180 ms, like a Dock icon) and grows its panel out of
+  it: the wrap's max-height animates 0 → panel height over
+  260 ms with `cubic-bezier(.2,1.35,.3,1)` overshoot while the
+  inner scales 0.85 → 1 / fades in with transform-origin at the
+  top edge under the owning chip (22% / 78%); collapse reverses
+  at 180 ms ease-in. The URL panel is the existing input + Go;
+  the Type panel is the existing input + Send + Enter, and the
+  server-note line moved inside it. One panel at a time (tapping
+  the other chip swaps, tapping the open chip collapses),
+  panels start collapsed, opening never auto-focuses an input,
+  and any mode switch collapses both. An open panel takes its
+  height from the surface (the only flex-grow row;
+  `body.panelOpen` lowers the surface min-height to 88 px), so
+  the fit from (C) holds with a panel open too.
+
+## v1.24 (Oct 29, 2026) — Siri Remote-style volume rocker + skip icons on the phone remote
+
+Remote-page visuals only (`assets/remote.html`, 32,058 → 36,879
+bytes; script passes `node --check`). No protocol change, no
+Java change beyond the version bump: every button sends exactly
+the messages it sent in v1.23. Modeled on the 1st-generation
+Siri Remote — glossy black, round buttons, and a tall vertical
+volume rocker.
+
+- **Volume rocker.** The two separate `Vol −` / `Vol +` pills
+  are now ONE vertical capsule (64 px wide, 120 px tall, fully
+  rounded, same dark glass fill as the round buttons) with a
+  hairline divider across the middle, a `+` glyph in the top
+  half (volume up) and a `−` in the bottom half (volume down),
+  each half with press feedback for the whole hold. **Holding a
+  half repeats the volume step**: v1.23's key-only repeat helper
+  is generalized into `startRepeat(sendFn, el, intervalMs, dir)`
+  / `stopRepeat()` — it takes a send-thunk, fires it immediately
+  on press-down, then re-fires after the same
+  `REPEAT_DELAY_MS = 400` ms at the caller's interval (keys stay
+  at 100 ms; volume uses `VOL_REPEAT_INTERVAL_MS = 120` ms,
+  slightly slower because TV volume steps are coarse). The
+  single-active-repeat rule is now shared across both controls:
+  starting a volume repeat stops a clickpad repeat and vice
+  versa. Stop paths are the clickpad's discipline, unchanged:
+  release, `touchcancel`, sliding off the half, mode switch,
+  WebSocket close, document `mouseup`, window blur — plus the
+  timestamp guards that keep touch and mouse from double-firing
+  (a quick tap is still exactly one step).
+- **Skip icons.** The `⟲10s` / `10s⟳` text pills are now two
+  circular glass buttons (60 px) in the iOS
+  `gobackward.10` / `goforward.10` style: an inline SVG arc of
+  ~300° (white, 2 px stroke, round caps) with a triangular
+  arrowhead at the opening — top-left, counter-clockwise for
+  back; top-right, clockwise for forward — drawn around a
+  centered `−10` / `+10` label. The label is an HTML `<span>`
+  overlaid on the SVG (crisper text than SVG `<text>` across
+  phone browsers). Still single-fire, still sending
+  `{"t":"seek","s":∓10}`.
+- **Layout.** The old four-across media pill row is now a media
+  cluster echoing the Siri Remote: on the left, the two skip
+  circles side by side, each with a small caption underneath
+  ("Skip back" / "Skip forward"); on the right, the 120 px
+  volume rocker, vertically centered against them. The cluster
+  shows in both trackpad and D-pad modes, as before. Nothing
+  else moved: surface, round Back/Play-Pause/Done row, nav
+  pills / Menu pill, URL bar, type bar and notes are untouched,
+  and no function was dropped.
+
+## v1.23 (Oct 29, 2026) — hold-to-repeat, slower trackpad scroll, input injection for native popups
+
+Three phone-remote fixes. Two live entirely in the remote page
+(`assets/remote.html`, 27,584 → 32,058 bytes; script passes
+`node --check`); the third reworks how the app delivers taps
+and phone keys to the page.
+
+- **Hold-to-repeat on the clickpad directions** (remote page
+  only; no protocol change). In v1.22 each phone tap/swipe was
+  one discrete key — the page now closes the nuance the v1.22
+  notes flagged. Pressing a direction zone (up/down/left/right)
+  fires its key **immediately on press-down**, and if the press
+  is still held after `REPEAT_DELAY_MS = 400` ms it keeps firing
+  every `REPEAT_INTERVAL_MS = 100` ms until the press ends.
+  Repeats are generated phone-side by sending more of the same
+  `{"t":"key",...}` messages. A shared
+  `startKeyRepeat(dir)` / `stopKeyRepeat()` pair owns the one
+  active repeat: a second finger (or a new press) on another
+  zone *replaces* it, never stacks. The zone's `.press`
+  highlight now stays lit for the whole hold instead of flashing
+  once. Every exit stops the timers: touch release and
+  `touchcancel` (both land in the existing `cpEnd`, which
+  suppresses its synthetic click as before), the finger sliding
+  off the zone (checked per `touchmove` via
+  `elementFromPoint`), a recognized flick, a mode switch
+  (`applyMode`), WebSocket close, and — for the mouse fallback —
+  `mouseup`, leaving the surface or the zone, and window blur.
+  A quick tap is unchanged in effect (one key, no repeats; the
+  400 ms delay guarantees it), it just fires on press-down
+  rather than release. Flick-vs-hold is disambiguated by the
+  existing 44 px swipe threshold: recognizing a flick cancels
+  the hold outright, so a finger lingering after a flick never
+  starts repeating; and because a touch that began on a
+  direction zone already delivered that key on press-down, the
+  flick does not add a second one (a flick that began off a
+  zone — OK or the gaps — fires exactly one key, at recognition,
+  as before). **OK never repeats** (repeated selects would be
+  destructive); Back, Menu and all other buttons are
+  single-fire, unchanged. Mouse holds repeat too
+  (`mousedown` fires + arms, the trailing `click` is
+  suppressed as already-handled).
+- **Trackpad two-finger scroll slowed by half** (remote page).
+  The two-finger vertical scroll now scales each finger delta
+  by `SCROLL_FACTOR = 0.5` (defined at the top of the script
+  next to the repeat constants) into the existing accumulator.
+  The accumulator is fractional end-to-end: scaled deltas build
+  up across `touchmove` events, whole scroll units are sent
+  (preserving the existing 3× output gain and sign convention),
+  and the fractional remainder is carried into the next move —
+  so slow small drags still register smoothly instead of being
+  truncated away per event. Cursor movement gain, tap and
+  long-press, and the clickpad are untouched.
+- **Input injection for native WebView popups** (`MainActivity`;
+  the only Java change besides the version bump). Bug, from a
+  TV photo: on a streaming site, tapping an HTML `<select>`
+  (a "Season 1" dropdown) opens Android WebView's *native*
+  select popup — a framework list in its **own window** floating
+  over the page. Our taps were `MotionEvent`s dispatched
+  directly to a view in our window, so they landed on the page
+  *underneath* the popup and could never choose an item, from
+  either the phone remote or the TV remote's mouse mode. Taps
+  and phone keys now go through the **system input queue**
+  (`Instrumentation.sendPointerSync` / `sendKeySync`), which
+  delivers to the top window at the coordinates like a real
+  finger: the select popup when it is open (it is created by
+  the WebView in our own process/UID, so injection is
+  permitted), the page otherwise; keys likewise reach the
+  foreground window automatically, and this app's own
+  `dispatchKeyEvent` interception still runs for injected keys
+  exactly as for hardware, because that is how hardware keys
+  arrive.
+  - `dispatchTap` / `dispatchFsTap` / `dispatchLongTap` keep
+    their names, callers and semantics (page tap vs fullscreen
+    tap vs long press), but build the gesture for injection:
+    events carry `InputDevice.SOURCE_TOUCHSCREEN` and a single
+    monotonic `downTime`; a tap is DOWN+UP ~40 ms apart; a
+    long press is DOWN, ~550 ms sleep, UP — a genuine hold, so
+    the WebView's link long-press menu flow is preserved.
+    Coordinates are **display coordinates**: callers pass
+    cursor/window coordinates (window is fullscreen), converted
+    explicitly through the root view's / fullscreen
+    container's `getLocationOnScreen` rather than any
+    WebView-local conversion. Phone-remote taps inherit the
+    fix automatically — the `RemoteServer.Host` tap/long-tap
+    callbacks funnel into these same three functions (verified:
+    no other path dispatches its own touch events).
+  - The v1.22 `injectKey` now tries `sendKeySync` (DOWN+UP)
+    first; the previous dialog/activity direct dispatch is
+    kept verbatim as `injectKeyViaDispatch` and is the
+    per-event fallback. This also makes phone D-pad keys work
+    *on* the select popup (Up/Down/OK/Back in the list).
+  - Thread model: `sendPointerSync`/`sendKeySync` block until
+    delivery, so all injection runs on one lazily created
+    single-thread executor, which also serializes every
+    gesture in submission order; the `Instrumentation` instance
+    is created lazily and only touched on that thread. The UI
+    thread only enqueues.
+  - Failure handling: any exception (e.g. `SecurityException`)
+    falls back for that gesture only — the whole gesture via
+    view dispatch if its DOWN never landed, or a completing UP
+    if it did (never a duplicated gesture) — and logs
+    `inject fallback <tap|fstap|longtap|key N>: <exception>`
+    under `HeckYeahFS`. The first successful injection logs
+    one `inject mode=instrumentation` line per app session.
+  - The video scroll clamp/poll, cursor behavior and
+    everything else are unchanged.
+- Manifest versionCode **24** / versionName **1.23**;
+  `alive version=1.23 code=24`.
+
+Build verification (build-verified only; hold-repeat feel,
+scroll sensitivity and popup tapping are device-test-only):
+
+- `aapt2 dump badging`: `com.heckyeah.tv` versionCode
+  **24** / versionName **1.23**, sdk 25 / target 25.
+- APK: 595,176 bytes, sha256
+  `f6a2990aeb1198f0d40aeaa393a8abc15d5d9946d58cbd50a1ba04b071201833`.
+- `apksigner verify`: OK; signer certificate SHA-256
+  `220529f9…b92fab5` (unchanged signing key).
+- `unzip -t`: no errors; the APK's `assets/remote.html` is
+  byte-identical to the source file.
+- Remote page script extracted and passed `node --check`.
+
+## v1.22 (Oct 29, 2026) — phone D-pad mode + Home pairing + Apple TV-style remote page
+
+Three additions, all around the phone remote (Kurt's ask: the
+phone should be able to drive the main menu too, pairing should
+be reachable from Home, and the phone page should look like the
+Apple TV Remote app).
+
+- **D-pad mode for non-browser screens.** New WebSocket command
+  `{"t":"key","k":"up|down|left|right|ok|back|menu"}` (the
+  v1.19 `k:"enter"` type-field command is unchanged and still
+  routes to the page-JS Enter). `RemoteServer` forwards it to a
+  new `Host.remoteKey`, implemented in `MainActivity` by
+  synthesizing the matching `KeyEvent` (DPAD arrows/center,
+  BACK, MENU) as an ACTION_DOWN + ACTION_UP pair and delivering
+  it exactly where a physical remote press lands:
+  - **A tracked dialog is showing** → the pair goes to the
+    dialog's own `dispatchKeyEvent`. Physical keys target the
+    foreground window, so D-pad moves dialog focus and BACK
+    cancels the dialog instead of acting on the screen behind
+    it. To make this possible, `trackDialog` now records the
+    showing dialog in an `openDialog` field, and the three
+    dialogs that previously bypassed the funnel (RW tile menu,
+    entry/mirror dialog, OMDb key editor) are now tracked too —
+    so phone keys work under *every* dialog.
+  - **Otherwise** → the pair goes through the activity's own
+    `dispatchKeyEvent`, so the app's interception layer runs
+    identically to hardware keys (MENU handling, fullscreen
+    first, browser key swallowing) and unhandled keys fall
+    through to the stock focus pipeline. BACK needs no special
+    case: it is not a browser key, so the pair falls to the
+    stock Activity callback (DOWN starts BACK tracking, UP
+    fires this app's `onBackPressed` override). Keys therefore
+    work on Home, category pages, Search, Settings, dialogs,
+    and in the browser (where they behave exactly like the
+    physical D-pad does today, e.g. moving the browser cursor).
+    One hardware nuance that cannot be replicated over discrete
+    messages: key auto-repeat on hold — each phone tap/swipe is
+    one discrete press.
+  - State JSON gains a **`"screen"`** field (`home` / `search`
+    / `settings` / `browser` / `other`) alongside the existing
+    `"browser"` bool, and `showScreen()` now calls
+    `pushRemoteState()` on **every** screen change (previously
+    pushes happened only on navigation callbacks, browser
+    open/close and the 2.5 s heartbeat), so a paired phone
+    follows the TV's screen/mode without lag.
+- **Pairing from the main menu.** Home's header row is now
+  Search · **Phone** · Settings (Kurt's explicit placement).
+  The Phone button opens the *existing* pairing panel
+  (`openRemotePanel`, reused unchanged — including its inline
+  Turn-on when the server is off; nothing in the panel is
+  browser-specific, and its dialog already rides `trackDialog`,
+  whose video kick no-ops off-browser). Its label tints accent
+  `#0A84FF` while any phone is paired, same rule as the browser
+  toolbar button: `refreshPhoneBtn()` now updates both buttons,
+  and `buildHome()` re-applies the tint on every rebuild.
+- **Remote page redesigned** (`assets/remote.html`, 14,615 →
+  27,584 bytes; script passes `node --check`). Pure-black
+  (`#000`) Apple TV Remote styling: `-apple-system` stack,
+  hairline `rgba(255,255,255,.1)` separators, sparing `#0A84FF`
+  accent, safe-area insets, hidden scrollbars. Top bar keeps the
+  connection dot + live title/URL (restyled, truncated). One
+  large rounded surface (radius 30px, `#2C2C2E → #1C1C1E`
+  gradient, hairline border) swaps content by mode:
+  - **Trackpad mode** (TV in browser): the v1.19 gesture engine
+    unchanged (accelerated drag, tap, 500 ms long-press,
+    two-finger scroll, mouse fallback), with a centered hint
+    that fades after the first touch.
+  - **D-pad mode** (TV anywhere else): a clickpad — 92px
+    circular OK button with radial highlight, four chevron tap
+    zones sending the new key commands, decisive-swipe
+    detection (a flick anywhere on the surface fires that
+    direction, clickpad-style), and scale/opacity press
+    feedback on the active zone.
+  - **Mode switching is automatic** (state `browser` true →
+    trackpad, false → D-pad), with a segmented
+    `[Trackpad | D-Pad]` control under the top bar: tapping it
+    overrides manually, and the override sticks until the TV's
+    browser flag *next changes*, then auto resumes. The active
+    mode is announced in small gray caps (`TRACKPAD — BROWSER`
+    / `D-PAD — MENU`).
+  - Below the surface: a row of 56px round glass buttons —
+    Back (iOS-style chevron-in-rounded-rect, sends the new
+    `key/back`, i.e. the TV remote's Back: dialog cancel,
+    page-back, screen-back), Play/Pause (combined glyph), and
+    Done (browser only; hidden in D-pad mode). A pill row holds
+    Nav Back / Forward / Reload in trackpad mode and swaps to a
+    single **Menu** pill (sends `key/menu`) in D-pad mode. The
+    URL bar and type-into-page field + Send + Enter are kept
+    (restyled as inset dark fields; shown in trackpad mode,
+    where they function), as are the volume −/+ and seek
+    ⟲10s / 10s⟳ pills (visible in both modes) and the server
+    note line. All main-control icons are inline stroke SVGs —
+    no emoji glyphs. The PIN sheet is restyled to match (black
+    sheet, big letter-spaced PIN input, accent Connect button,
+    `#FF453A` errors); the pairing flow, protocol, message
+    shapes and reconnection behavior are otherwise identical —
+    the only protocol addition is the one `key` command.
+- Manifest versionCode **23** / versionName **1.22**;
+  `alive version=1.22 code=23`.
+
+Build verification (build-verified only; D-pad key delivery,
+dialog routing, Home pairing and the new page's feel are
+device-test-only — no emulator exercises the LAN server):
+
+- `aapt2 dump badging`: `com.heckyeah.tv` versionCode
+  **23** / versionName **1.22**, sdk 25 / target 25.
+- APK: 591,080 bytes, sha256
+  `e5cbdf18e95491340166b2aa77d70d00096cf76ea759036ffbe235da9956dc97`.
+- `apksigner verify`: OK; signer certificate SHA-256
+  `220529f9…b92fab5` (unchanged signing key).
+- `unzip -t`: no errors; the APK's `assets/remote.html` is
+  byte-identical to the source file.
+
+## v1.21 (Oct 28, 2026) — revive black video after dialogs/pairing (video-layer kick)
+
+Field report on v1.20: a video is playing inline; the user
+opens the pairing panel, pairs the phone, and closes the
+panel — the video area is **black and stays black** until
+the browser bar is revealed, whose resize revives it.
+
+Mechanism: on this API-25 Chromium, page video renders as a
+hardware surface shining through a hole the compositor cuts
+in the page. A second window (the app's dialogs are real
+`AlertDialog`s) opening/closing over the activity desyncs
+that hole, and only a WebView size change forces Chromium
+to recompute it — exactly what showing/hiding the header
+does. The fix reproduces that resize programmatically at
+the moments the desync can occur.
+
+- **`kickVideoLayer(why)`:** one guarded 1px nudge — the
+  bottom padding of `browserCol` (the WebView's direct
+  parent) is set to 1px (its current padding captured
+  first), `requestLayout` on the column and the WebView
+  plus `webView.invalidate()`, then after ~50 ms the
+  captured padding is restored exactly and layout is
+  requested again. A re-entrancy flag covers the restore
+  window. No header or visibility toggling: nothing
+  visible changes (1px for one frame is the point). Each
+  kick that actually fires logs `videokick <why>` under
+  `HeckYeahFS`.
+- **Gating:** browser screen current, no real fullscreen
+  session, WebView/column live, and the freshest video
+  poll (< 2 s old) reporting a playing video (`videoFound`
+  + `videoDataAt`). One stated exception: `why="pair"`
+  also fires with **no poll data at all**
+  (`videoDataAt == 0`), because a first pairing usually
+  happens while the pairing dialog has starved the poll
+  (the poll skips while any dialog is open). `"dialog"`
+  and `"tip"` get no exception, and stale poll data never
+  kicks.
+- **Call sites (three):** (a) the shared `trackDialog`
+  dismiss funnel — when `browserDialogDepth` returns to 0,
+  a posted `kickVideoLayer("dialog")`. The pairing panel,
+  which previously open-coded its own show/dismiss
+  counting, now uses a `trackDialog` overload (its dismiss
+  cleanup runs as an extra runnable) so the reported flow
+  is covered by the same funnel. (b)
+  `remoteSessionsChanged()` on the paired-count transition
+  0 → >0 (`lastRemotePairedCount`), kicked *before* the
+  pairing tip is hidden so the pair kick is the one that
+  fires/logs when both apply. (c) `hidePairTip()` when it
+  actually hid a **visible** tip while the browser is
+  current.
+- No timers, no heartbeat kicks, nothing else changed.
+  Manifest versionCode **22** / versionName **1.21**;
+  `alive version=1.21 code=22`.
+
+Build verification (build-verified only; the black-video
+revival itself is device-test-only):
+
+- `aapt2 dump badging`: `com.heckyeah.tv` versionCode
+  **22** / versionName **1.21**, sdk 25 / target 25.
+- APK: 586,984 bytes, sha256
+  `b2ba58920c4f7ea7e009b0415e2ad2b60eb43bcb3b27da732438750e4953488a`.
+- `apksigner verify`: OK; signer certificate SHA-256
+  `220529f9…b92fab5` (unchanged signing key).
+- `unzip -t`: no errors.
+
+## v1.20 (Oct 28, 2026) — Phone button in the browser nav + pairing tooltip
+
+Two discoverability additions for the v1.19 phone remote; no
+server or protocol changes.
+
+- **Phone button in the browser toolbar:** a plain-text "Phone"
+  button (no glyph — the bundled Inter font's symbol coverage on
+  Fire OS is not trustworthy) sits between the Mouse/D-pad mode
+  button and the ⚙ gear in both layout order and the D-pad
+  toolbar-focus order (`toolbarViews`), styled exactly like its
+  neighbors (focus shown by the pill ring, no scale). Tapping it
+  opens the existing v1.19 pairing panel (which still handles
+  the server-off state with its inline "Turn on"). The label
+  tints accent `#0A84FF` while at least one phone is paired and
+  returns to the normal toolbar color at zero; the tint is
+  refreshed on session changes, on server start/stop, on every
+  browser entry, and via the 2.5 s state heartbeat, so it cannot
+  go stale.
+- **Launch tooltip:** when the browser becomes current with
+  zero phones paired, a hint bubble appears once per browser
+  session (~700 ms in, re-validated at fire time: browser still
+  current, no dialog open, not fullscreen, still unpaired):
+  "Pair your phone to use it as a trackpad and keyboard for
+  this browser — tap Phone in the toolbar." The bubble is a
+  non-clickable, non-focusable TextView in the browser pane
+  (above the WebView, below the cursor overlay), positioned
+  just below the header with its right edge aligned to the
+  Phone button's right edge (computed from on-screen positions
+  at show time, fixed-margin fallback). It fades in over
+  200 ms, auto-hides after 6 s, and hides immediately when the
+  Phone button is tapped, a phone pairs, the screen changes,
+  fullscreen starts, or the browser closes. The shown-flag
+  resets on browser close, so a later launch with still-zero
+  phones hints again — but never twice in one session.
 
 ## v1.19 (Oct 28, 2026) — phone remote (Core + A–E)
 

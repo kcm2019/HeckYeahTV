@@ -4,6 +4,7 @@ import android.animation.AnimatorListenerAdapter;
 import android.animation.ValueAnimator;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.Instrumentation;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
@@ -18,7 +19,13 @@ import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.graphics.Path;
+import android.graphics.PorterDuff;
 import android.graphics.Rect;
+import android.graphics.RectF;
+import android.graphics.drawable.BitmapDrawable;
+import android.graphics.drawable.Drawable;
+import android.graphics.drawable.LayerDrawable;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.media.AudioManager;
@@ -31,6 +38,7 @@ import android.text.TextUtils;
 import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.Gravity;
+import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.SurfaceView;
@@ -40,6 +48,7 @@ import android.view.ViewTreeObserver;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.view.animation.DecelerateInterpolator;
+import android.view.animation.LinearInterpolator;
 import android.view.inputmethod.EditorInfo;
 import android.webkit.CookieManager;
 import android.webkit.ValueCallback;
@@ -82,6 +91,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -139,6 +150,7 @@ public class MainActivity extends Activity {
     private static final int TEXT = Color.parseColor("#F2F2F7");
     private static final int DIM = Color.parseColor("#AEAEB2");
     private static final int ACCENT = Color.parseColor("#0A84FF");
+    private static final int DONE_RED = Color.parseColor("#FF453A"); // v1.27: toolbar Done
     private static final int SAFARI_BG = Color.parseColor("#F2F2F7");
     private static final int SAFARI_TEXT = Color.parseColor("#1C1C1E");
     private static final int PILL = Color.parseColor("#FFFFFF");
@@ -922,15 +934,25 @@ public class MainActivity extends Activity {
     }
 
     // v1.3: browser appearance (Dark default / Light) - chrome colors
-    private LinearLayout browserBar;
+    private FrameLayout browserBar;
     private Button appearanceBtnSettings;
     private boolean browserDark() {
         return !"light".equals(prefs.getString(KEY_APPEARANCE, "dark"));
     }
-    private int tbBg() { return browserDark() ? Color.parseColor("#1C1C1E") : SAFARI_BG; }
-    private int tbPill() { return browserDark() ? Color.parseColor("#2C2C2E") : PILL; }
-    private int tbText() { return browserDark() ? Color.parseColor("#F2F2F7") : SAFARI_TEXT; }
+    private int tbText() { return browserDark() ? Color.parseColor("#F5F5F7") : Color.parseColor("#1D1D1F"); }
     private int tbBorder() { return browserDark() ? Color.parseColor("#48484A") : PILL_BORDER; }
+    // v1.29: floating-glass nav bar palette. Dark = graphite glass,
+    // light = porcelain glass; both translucent so the bar floats
+    // over video/pages instead of sitting on an opaque slab. The
+    // gradient runs a touch lighter at the top (the "sheen" a real
+    // glass material gets from its top highlight).
+    private int tbSecondary() { return browserDark() ? Color.parseColor("#A1A1A6") : Color.parseColor("#6E6E73"); }
+    private int glassTop() { return browserDark() ? Color.argb(224, 34, 35, 41) : Color.argb(242, 255, 255, 255); }
+    private int glassBot() { return browserDark() ? Color.argb(224, 20, 21, 25) : Color.argb(235, 242, 242, 247); }
+    private int glassBorder() { return browserDark() ? Color.argb(36, 255, 255, 255) : Color.argb(20, 0, 0, 0); }
+    private int glassDivider() { return browserDark() ? Color.argb(36, 255, 255, 255) : Color.argb(26, 0, 0, 0); }
+    private int focusFill() { return browserDark() ? Color.argb(36, 255, 255, 255) : Color.argb(18, 0, 0, 0); }
+    private int capsuleInset() { return browserDark() ? Color.argb(14, 255, 255, 255) : Color.argb(10, 0, 0, 0); }
     private Context dialogContext() {
         return browserDark() ? (Context) this
                 : new ContextThemeWrapper(this, android.R.style.Theme_Material_Light_Dialog);
@@ -952,6 +974,13 @@ public class MainActivity extends Activity {
 
     private WebView webView;
     private LinearLayout browserCol;
+    // v1.29: floating glass bar pieces - the two segmented clusters,
+    // the address capsule (a toolbar stop in place of the bare pill),
+    // and the hairline dividers inside the clusters (recolored with
+    // the appearance, so they are tracked).
+    private LinearLayout navCluster, rightCluster;
+    private FrameLayout addrCapsule;
+    private final List<View> tbDividers = new ArrayList<>();
     // v1.4: auto-hiding header block (toolbar + title strip + progress)
     private LinearLayout headerBlock;
     private boolean headerHidden = false;
@@ -971,7 +1000,30 @@ public class MainActivity extends Activity {
     private FrameLayout fsContainer;
     private TextView urlPill;
     private ProgressBar pageProgress;
-    private Button tbBack, tbFwd, tbReload, tbMode, tbGear, tbDone;
+    private FrameLayout tbBack, tbFwd, tbReload, tbMode, tbPhone, tbGear, tbDone;
+    private Button homePhoneBtn; // v1.22: Home header Phone button (rebuilt with Home)
+    // v1.25: Mode/Phone are icon buttons in the browser toolbar. The
+    // icons are drawn on a Canvas at build time (font glyphs for a
+    // mouse / phone are not trustworthy on Fire OS) and tinted via
+    // color filter, so dark/light chrome and the paired accent are
+    // just re-tints of the same bitmaps.
+    private BitmapDrawable modeMouseIcon, modeDpadIcon, phoneIconDrawable;
+    // v1.27: the rest of the toolbar is canvas-drawn icons too
+    // (Back / Forward / Reload / Settings / Done), each its own
+    // drawable so Back/Forward can dim independently.
+    private BitmapDrawable backIcon, fwdIcon, reloadIcon, gearIcon, doneIcon;
+    // v1.25: one shared name bubble for toolbar elements, shown on
+    // mouse hover (350ms dwell) and on D-pad toolbar focus (150ms).
+    private TextView toolbarTipView;
+    private View toolbarTipTarget;   // element the visible bubble names
+    private View pendingTipTarget;   // element waiting out its dwell
+    private final Runnable toolbarTipShowRunnable = new Runnable() {
+        @Override public void run() {
+            View v = pendingTipTarget;
+            pendingTipTarget = null;
+            if (v != null) showToolbarTip(v);
+        }
+    };
     private final List<View> toolbarViews = new ArrayList<>();
     private int toolbarIndex = 2;       // default: URL pill
     private boolean toolbarFocus = false;
@@ -1022,6 +1074,10 @@ public class MainActivity extends Activity {
     private long centerDownAt = 0;
     private long lastMenuShownAt = 0;
     private int browserDialogDepth = 0;
+    // v1.22: the currently-showing tracked dialog, so phone D-pad
+    // keys can be delivered to ITS window (physical remote keys go
+    // to the foreground window, not the activity's).
+    private AlertDialog openDialog;
 
     // v1.15: VIDEO-BOUNDED SCROLL AREA (replaces v1.13's binary
     // lock; field report, Oct 28: "The browser when video is playing
@@ -1044,9 +1100,11 @@ public class MainActivity extends Activity {
     // clamped, and nothing scrolls in HTML5 fullscreen.
     private boolean videoFound = false;
     private float vidL, vidT, vidR, vidB; // video rect, CSS PAGE coords
+    private float vidViewL, vidViewT, vidViewR, vidViewB; // same rect, CSS VIEWPORT coords
     private float vidInnerW, vidInnerH;   // CSS viewport size
     private float vidDocW, vidDocH;       // CSS document scroll size
     private long videoDataAt = 0;         // timestamp of the last good poll
+    private boolean videoKickInFlight = false; // v1.21: 1px layout nudge in progress
     // v1.16: PSEUDO-fullscreen detection. Some players never
     // hand a custom view to the app (no onShowCustomView, so
     // no FS handler/guard/logs at all): the page just makes
@@ -1063,6 +1121,134 @@ public class MainActivity extends Activity {
     private boolean inPageFsLogged = false; // "inpage-fs" logs once per page
     private boolean videoHintShown = false; // once per navigation
     private boolean videoPollRunning = false;
+    // v1.26: center-screen action feedback. One decor-level
+    // ImageView flashes a big glyph (play / pause / seek -10 /
+    // seek +10) YouTube-style whenever a seek or a play/pause
+    // toggle lands, from EITHER remote. Glyphs are drawn once
+    // into bitmaps (font glyphs are untrustworthy on Fire OS).
+    // feedbackGen invalidates pending fade-outs on retrigger.
+    private ImageView feedbackView;
+    private Bitmap fbPlayBmp, fbPauseBmp, fbSeekBackBmp, fbSeekFwdBmp;
+    private int feedbackGen = 0;
+
+    /** Lazily drawn feedback glyphs: "play" | "pause" | "back" | "fwd". */
+    private Bitmap fbBitmap(String kind) {
+        switch (kind) {
+            case "play":  if (fbPlayBmp == null) fbPlayBmp = drawFeedbackGlyph(kind); return fbPlayBmp;
+            case "pause": if (fbPauseBmp == null) fbPauseBmp = drawFeedbackGlyph(kind); return fbPauseBmp;
+            case "back":  if (fbSeekBackBmp == null) fbSeekBackBmp = drawFeedbackGlyph(kind); return fbSeekBackBmp;
+            default:      if (fbSeekFwdBmp == null) fbSeekFwdBmp = drawFeedbackGlyph(kind); return fbSeekFwdBmp;
+        }
+    }
+
+    private Bitmap drawFeedbackGlyph(String kind) {
+        int s = dp(92);
+        Bitmap bmp = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888);
+        Canvas c = new Canvas(bmp);
+        float cx = s / 2f, cy = s / 2f;
+        Paint bg = new Paint(Paint.ANTI_ALIAS_FLAG);
+        bg.setStyle(Paint.Style.FILL);
+        bg.setColor(Color.argb(140, 0, 0, 0)); // black at ~55% alpha
+        c.drawCircle(cx, cy, s / 2f, bg);
+        Paint w = new Paint(Paint.ANTI_ALIAS_FLAG);
+        w.setColor(Color.WHITE);
+        if ("play".equals(kind)) {
+            w.setStyle(Paint.Style.FILL);
+            Path tri = new Path();
+            tri.moveTo(cx - s * 0.15f, cy - s * 0.21f);
+            tri.lineTo(cx - s * 0.15f, cy + s * 0.21f);
+            tri.lineTo(cx + s * 0.25f, cy);
+            tri.close();
+            c.drawPath(tri, w);
+        } else if ("pause".equals(kind)) {
+            w.setStyle(Paint.Style.FILL);
+            float bw = s * 0.13f, bh = s * 0.21f, off = s * 0.115f, rad = s * 0.03f;
+            c.drawRoundRect(new RectF(cx - off - bw / 2, cy - bh, cx - off + bw / 2, cy + bh), rad, rad, w);
+            c.drawRoundRect(new RectF(cx + off - bw / 2, cy - bh, cx + off + bw / 2, cy + bh), rad, rad, w);
+        } else {
+            // Seek: circular arc arrow + number. v1.30: rebuilt on
+            // the same render-verified construction as the toolbar
+            // reload - the arc stops at the head's BASE CENTER and
+            // the filled head grows out of it: tip on the circle,
+            // base center 0.44 rad back along the travel direction,
+            // base corners radial at +-0.24r, butt cap. (v1.26 put
+            // the tip 0.105s BEYOND the arc end along the tangent
+            // with the base straddling the circle - a kite.)
+            // Android angles: 0 deg = 3 o'clock, positive sweep =
+            // clockwise (y is down). Forward (clockwise): tip at
+            // 305 deg, tail at 25 deg. Back is the exact mirror:
+            // tip at 235 deg, tail at 155 deg, negative sweep.
+            boolean fwd = "fwd".equals(kind);
+            float r = s * 0.205f;
+            RectF oval = new RectF(cx - r, cy - r, cx + r, cy + r);
+            w.setStyle(Paint.Style.STROKE);
+            w.setStrokeWidth(s * 0.05f);
+            w.setStrokeCap(Paint.Cap.BUTT);
+            double tipDeg = fwd ? 305 : 235;
+            double headDeg = Math.toDegrees(0.44); // head length 0.44 * r of arc
+            double baseDeg = fwd ? tipDeg - headDeg : tipDeg + headDeg;
+            double sweepEnd = fwd ? baseDeg : baseDeg - 360; // unwrap back's negative sweep
+            if (fwd) c.drawArc(oval, 25f, (float) (sweepEnd - 25.0), false, w);
+            else c.drawArc(oval, 155f, (float) (sweepEnd - 155.0), false, w);
+            double tr = Math.toRadians(tipDeg), br = Math.toRadians(baseDeg);
+            float px = cx + (float) (r * Math.cos(tr)), py = cy + (float) (r * Math.sin(tr));
+            float bx = cx + (float) (r * Math.cos(br)), by = cy + (float) (r * Math.sin(br));
+            float hb = r * 0.24f; // half the base width
+            float nx = (float) Math.cos(br), ny = (float) Math.sin(br);
+            Path head = new Path();
+            head.moveTo(px, py);
+            head.lineTo(bx + nx * hb, by + ny * hb);
+            head.lineTo(bx - nx * hb, by - ny * hb);
+            head.close();
+            w.setStyle(Paint.Style.FILL);
+            c.drawPath(head, w);
+            Paint t = new Paint(Paint.ANTI_ALIAS_FLAG);
+            t.setColor(Color.WHITE);
+            t.setTextSize(s * 0.21f);
+            t.setFakeBoldText(true);
+            t.setTextAlign(Paint.Align.CENTER);
+            Paint.FontMetrics fm = t.getFontMetrics();
+            c.drawText(fwd ? "+10" : "\u221210", cx, cy - (fm.ascent + fm.descent) / 2, t);
+        }
+        return bmp;
+    }
+
+    /**
+     * v1.26: flash a feedback glyph center-screen: fade/scale in
+     * (~120ms), hold (~350ms), fade out (~300ms). Retriggering
+     * swaps the bitmap and restarts via the generation counter.
+     * Browser-gated; callers are the shared seek + toggle paths.
+     */
+    private void showActionFeedback(Bitmap bm) {
+        if (bm == null || feedbackView == null) return;
+        if (currentScreen != browserPane) return;
+        final int gen = ++feedbackGen;
+        feedbackView.animate().cancel();
+        feedbackView.setImageBitmap(bm);
+        feedbackView.setAlpha(0f);
+        feedbackView.setScaleX(0.7f);
+        feedbackView.setScaleY(0.7f);
+        feedbackView.setVisibility(View.VISIBLE);
+        feedbackView.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(120).start();
+        ui.postDelayed(() -> {
+            if (gen != feedbackGen) return;
+            feedbackView.animate().alpha(0f).scaleX(1.06f).scaleY(1.06f)
+                    .setDuration(300)
+                    .withEndAction(() -> {
+                        if (gen == feedbackGen) feedbackView.setVisibility(View.GONE);
+                    })
+                    .start();
+        }, 470); // 120 in + 350 hold
+    }
+
+    /** v1.26: kill any in-flight feedback (leaving the browser). */
+    private void cancelActionFeedback() {
+        feedbackGen++;
+        if (feedbackView != null) {
+            feedbackView.animate().cancel();
+            feedbackView.setVisibility(View.GONE);
+        }
+    }
     private static final String VIDEO_POLL_JS =
             "(function(){try{"
             + "var IW=window.innerWidth,IH=window.innerHeight;"
@@ -1125,6 +1311,7 @@ public class MainActivity extends Activity {
      *  good poll lands. */
     private void clearVideoData() {
         videoFound = false;
+        vidViewL = vidViewT = vidViewR = vidViewB = 0;
         videoDataAt = 0;
         pseudoFs = false; // v1.16: silent reset (navigation / real FS / Done) - no OFF log
         pseudoFsAt = 0;
@@ -1148,6 +1335,10 @@ public class MainActivity extends Activity {
                         vidT = (float) o.optDouble("t", 0);
                         vidR = (float) o.optDouble("r", 0);
                         vidB = (float) o.optDouble("b", 0);
+                        vidViewL = (float) o.optDouble("vl", 0);
+                        vidViewT = (float) o.optDouble("vt", 0);
+                        vidViewR = (float) o.optDouble("vr", 0);
+                        vidViewB = (float) o.optDouble("vb", 0);
                     }
                     // v1.16: pseudo-FS state from this poll. The
                     // JS "ps" flag only measures viewport coverage;
@@ -1310,6 +1501,64 @@ public class MainActivity extends Activity {
     private int pageScrollStep() {
         return Math.max(dp(48), webView.getHeight() - dp(48));
     }
+
+    /**
+     * v1.21: revive a black inline video after an overlaying
+     * window closes. On this API-25 Chromium the playing video
+     * is a hardware surface visible through a compositor hole
+     * in the page; an AlertDialog opening/closing over the
+     * activity can desync that hole, and the surface stays
+     * black until the WebView changes size (which is why
+     * revealing the browser bar - a WebView resize - revived
+     * it). This reproduces that resize harmlessly: browserCol
+     * (the WebView's direct parent) gets 1px of bottom padding
+     * for ~50ms, shrinking the WebView's height by 1px, then
+     * the captured padding is restored exactly. No header or
+     * visibility toggling, so nothing visible changes.
+     *
+     * Gating: browser current, no real fullscreen, views live,
+     * and the freshest poll (<2s) reporting a playing video.
+     * The one exception is why="pair": a first phone pairing
+     * typically happens while the pairing dialog has starved
+     * the poll (the poll skips while a dialog is open), so a
+     * pair kick also fires with NO poll data at all
+     * (videoDataAt == 0). Stale poll data never kicks.
+     */
+    private void kickVideoLayer(String why) {
+        if (videoKickInFlight) return;
+        if (currentScreen != browserPane || fsView != null
+                || webView == null || browserCol == null) return;
+        long now = System.currentTimeMillis();
+        boolean freshPlaying = videoFound && videoDataAt > 0
+                && now - videoDataAt < 2000;
+        boolean pairWithoutPoll = "pair".equals(why) && videoDataAt == 0;
+        if (!freshPlaying && !pairWithoutPoll) return;
+        videoKickInFlight = true;
+        final int prevLeft = browserCol.getPaddingLeft();
+        final int prevTop = browserCol.getPaddingTop();
+        final int prevRight = browserCol.getPaddingRight();
+        final int prevBottom = browserCol.getPaddingBottom();
+        try {
+            browserCol.setPadding(prevLeft, prevTop, prevRight, 1);
+            browserCol.requestLayout();
+            webView.requestLayout();
+            webView.invalidate();
+            Log.d("HeckYeahFS", "videokick " + why);
+            browserCol.postDelayed(() -> {
+                try {
+                    browserCol.setPadding(prevLeft, prevTop, prevRight, prevBottom);
+                    browserCol.requestLayout();
+                    webView.requestLayout();
+                    webView.invalidate();
+                } catch (Exception ignored) {
+                } finally {
+                    videoKickInFlight = false;
+                }
+            }, 50);
+        } catch (Exception ignored) {
+            videoKickInFlight = false;
+        }
+    }
     private ScrollView currentScroll;
 
     private String currentCat, expandedShelfBackCat;
@@ -1343,7 +1592,7 @@ public class MainActivity extends Activity {
         // THIS build leaves exactly one unmistakable line, so
         // an empty HeckYeahFS dump can never again be confused
         // with "the guard saw nothing to fix".
-        Log.d("HeckYeahFS", "alive version=1.19 code=20");
+        Log.d("HeckYeahFS", "alive version=1.32 code=33");
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         browserMouse = prefs.getBoolean(KEY_MOUSE, true);
         AdBlock.enabled = prefs.getBoolean(KEY_ADBLOCK, true);
@@ -1421,26 +1670,29 @@ public class MainActivity extends Activity {
         g.setStroke(focused ? dp(3) : dp(1), focused ? Color.WHITE : Color.parseColor("#48484A"));
         return g;
     }
-    private GradientDrawable pillBg(boolean focused) {
-        GradientDrawable g = new GradientDrawable();
-        g.setColor(tbPill()); g.setCornerRadius(dp(20));
-        g.setStroke(focused ? dp(3) : dp(1), focused ? ACCENT : tbBorder());
-        return g;
-    }
-
     /** v1.3: restyle the whole browser chrome for Dark/Light, no reload. */
     private void applyBrowserAppearance() {
-        if (browserBar != null) browserBar.setBackgroundColor(tbBg());
+        // v1.29: bar + title sit on the floating glass now - the row
+        // and the title line have no slab behind them.
+        if (browserBar != null) browserBar.setBackgroundColor(Color.TRANSPARENT);
         if (browserTitle != null) {
-            browserTitle.setBackgroundColor(tbBg());
-            browserTitle.setTextColor(browserDark() ? DIM : Color.parseColor("#8E8E93"));
+            browserTitle.setBackgroundColor(Color.TRANSPARENT);
+            browserTitle.setTextColor(tbSecondary());
         }
+        if (urlPill != null) urlPill.setTextColor(tbText());
+        if (navCluster != null) navCluster.setBackground(glassBg(20, false));
+        if (rightCluster != null) rightCluster.setBackground(glassBg(20, false));
+        for (View dv : tbDividers) dv.setBackgroundColor(glassDivider());
         if (browserCol != null)
             browserCol.setBackgroundColor(browserDark() ? Color.BLACK : SAFARI_BG);
         for (View v : toolbarViews) {
             if (v instanceof TextView) ((TextView) v).setTextColor(tbText());
-            v.setBackground(pillBg(false));
+            v.setBackground(toolbarBg(v, false)); // v1.29: capsule / segment / ghost / Done
         }
+        retintToolbarIcons(); // v1.27: Back/Fwd/Reload/Gear follow the appearance; Done stays red
+        updateModeBtn();   // v1.25: re-tint the Mode icon for the new appearance
+        refreshPhoneBtn(); // v1.25: same for the Phone icon (keeps any paired accent)
+        applyPairCardTheme(); // v1.28: the pairing card follows the chrome too
         styleToolbarFocus();
     }
 
@@ -1569,6 +1821,19 @@ public class MainActivity extends Activity {
         cursorView.setVisibility(View.GONE);
         decor.addView(cursorView, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        // v1.26: center action-feedback flash (seek / play / pause),
+        // also at the DECOR level so it renders identically over the
+        // inline browser, real fullscreen and pseudo-fullscreen.
+        // Added after the cursor so it sits topmost; it never takes
+        // touches or focus.
+        feedbackView = new ImageView(this);
+        feedbackView.setVisibility(View.GONE);
+        feedbackView.setClickable(false);
+        feedbackView.setFocusable(false);
+        FrameLayout.LayoutParams fbLp = new FrameLayout.LayoutParams(dp(92), dp(92));
+        fbLp.gravity = Gravity.CENTER;
+        decor.addView(feedbackView, fbLp);
     }
 
     private LinearLayout pageColumn() {
@@ -1584,7 +1849,15 @@ public class MainActivity extends Activity {
         for (View x : all) x.setVisibility(x == v ? View.VISIBLE : View.GONE);
         currentScreen = v;
         currentScroll = v instanceof ScrollView ? (ScrollView) v : null;
-        if (v == browserPane) kickVideoPoll(); // v1.13: (re)start the video poll; it self-stops off-browser
+        if (v == browserPane) {
+            kickVideoPoll(); // v1.13: (re)start the video poll; it self-stops off-browser
+            refreshPhoneBtn(); // v1.20: pairing tint can't go stale across screens
+            maybeAutoPairPopup(); // auto pairing card, once per browser session (v1.27 popup; v1.28 card)
+        } else {
+            cancelAutoPairPopup(); // no pending/visible auto pairing card off-browser
+            hideToolbarTip(); // v1.25: tooltips exist only over the browser toolbar
+            cancelActionFeedback(); // v1.26: the center flash is browser-only
+        }
         if (v == settingsScroll) {
             refreshSettingsLabels();
             // v1.8: entering Settings lands focus on the FIRST
@@ -1595,15 +1868,87 @@ public class MainActivity extends Activity {
                 if (browserModeBtnSettings != null) browserModeBtnSettings.requestFocus();
             });
         }
-        updateCursorVisibility();
+        refreshCursor("screen"); // v1.32 (was updateCursorVisibility)
+        // v1.22: EVERY screen change pushes remote state immediately
+        // (previously pushes happened only on navigation callbacks,
+        // browser open/close and the 2.5s heartbeat), so a paired
+        // phone's trackpad/D-pad mode follows the TV without lag.
+        // No-ops until the server exists.
+        pushRemoteState();
     }
 
     /** Mouse cursor exists ONLY inside the browser, in mouse sub-mode. */
     private void updateCursorVisibility() {
+        refreshCursor("update");
+    }
+
+    // v1.32: what refreshCursor last asserted - lets it tell a
+    // routine show/hide from a RESCUE (the view disagreed with the
+    // state we believed it was in).
+    private boolean cursorAssertedShown = false;
+
+    /**
+     * v1.32: the cursor's single SELF-HEALING gate (replaces the
+     * old updateCursorVisibility body). Kurt: toggling the browser
+     * input mode from the nav-bar Mode button while a phone was
+     * connected killed the cursor until an app restart. The old
+     * gate only ever set visibility - it never looked at ALPHA.
+     * The fullscreen idle fade is the cursor's only alpha writer,
+     * and its restore paths (pokeFsCursor / cancelFsFade) are
+     * both conditional on the cursorFaded flag, so any divergence
+     * between that flag and the view's real alpha - an animator
+     * completing or being cancelled across a mode / dialog /
+     * pairing transition - left a VISIBLE view sitting at alpha 0
+     * with nothing that would ever restore it (moveCursor only
+     * calls pokeFsCursor, which no-ops when cursorFaded is
+     * false), and setBrowserMouse(true) - the exact transition in
+     * Kurt's report - never cancelled a fade animation or
+     * restored alpha either. On top of that, the phone-connected
+     * transitions (remoteSessionsChanged, dialog show/dismiss,
+     * pairing card show/hide) never re-asserted the cursor at all.
+     *
+     * refreshCursor recomputes the truth from (browser current &&
+     * mouse mode): when the cursor should show, it forces VISIBLE,
+     * cancels any stray alpha animation and restores alpha 1 -
+     * UNLESS the fsLike idle fade legitimately owns the alpha
+     * (fsLikeActive() && cursorFaded) - re-asserts the decor
+     * z-order (cursor above content/fsContainer, the v1.26
+     * feedback flash back on top), and invalidates. When it
+     * should hide, GONE. HeckYeahFS logs ONLY on change or rescue:
+     * "cursor show/hide/rescue why=<reason>".
+     */
+    private void refreshCursor(String why) {
         if (cursorView == null) return;
         boolean show = currentScreen == browserPane && browserMouse;
-        cursorView.setVisibility(show ? View.VISIBLE : View.GONE);
-        if (show) cursorView.invalidate();
+        if (!show) {
+            if (cursorView.getVisibility() == View.VISIBLE)
+                Log.d("HeckYeahFS", "cursor hide why=" + why);
+            cursorView.setVisibility(View.GONE);
+            cursorAssertedShown = false;
+            return;
+        }
+        boolean wasGone = cursorView.getVisibility() != View.VISIBLE;
+        boolean legitFade = fsLikeActive() && cursorFaded;
+        boolean alphaBad = !legitFade && cursorView.getAlpha() < 0.99f;
+        if (alphaBad) {
+            // A fade animator (or its cancel) left the alpha
+            // somewhere the flag says it shouldn't be: kill the
+            // animator and put the alpha back, or this cursor
+            // would stay invisible while marked VISIBLE forever.
+            cursorView.animate().cancel();
+            cursorView.setAlpha(1f);
+        }
+        if (wasGone) {
+            Log.d("HeckYeahFS", (cursorAssertedShown
+                    ? "cursor rescue why=" : "cursor show why=") + why);
+        } else if (alphaBad) {
+            Log.d("HeckYeahFS", "cursor rescue why=" + why);
+        }
+        cursorView.setVisibility(View.VISIBLE);
+        cursorView.bringToFront();
+        if (feedbackView != null) feedbackView.bringToFront(); // v1.26 flash stays topmost
+        cursorView.invalidate();
+        cursorAssertedShown = true;
     }
 
     // ---------------------------------------------------------- Resume bar (Back to page)
@@ -1893,10 +2238,20 @@ public class MainActivity extends Activity {
         // it can point DOWN at the first tile (wired at the end).
         bSearch.setId(View.generateViewId());
         bSearch.setOnClickListener(v -> showSearch());
+        // v1.22: pairing from the main menu - Phone sits BETWEEN
+        // Search and Settings (Kurt's placement) and opens the same
+        // pairing panel as the browser toolbar button (which offers
+        // its inline Turn-on when the server is off - nothing about
+        // the panel is browser-specific; its dialog is tracked via
+        // trackDialog and the video kick no-ops off-browser).
+        homePhoneBtn = safariBtn("Phone", false);
+        homePhoneBtn.setOnClickListener(v -> openRemotePanel());
         Button bSettings = safariBtn("\u2699 Settings", false);
         bSettings.setOnClickListener(v -> showScreen(settingsScroll));
         head.addView(bSearch, gapLp(false));
+        head.addView(homePhoneBtn, gapLp(false));
         head.addView(bSettings, gapLp(false));
+        refreshPhoneBtn(); // v1.22: a fresh Home build re-applies the paired tint
         homeContent.addView(head);
 
         // RW: Recently Watched is the FIRST shelf when non-empty.
@@ -2142,7 +2497,7 @@ public class MainActivity extends Activity {
             // the poster and blocks auto-lookup until a Re-fetch.
             final String hash = rwHash(item.url);
             String[] opts = {"\u21BB Re-fetch poster", "\u2715 Remove poster art", "Remove entry"};
-            new AlertDialog.Builder(this).setTitle(item.title)
+            AlertDialog rwDlg = new AlertDialog.Builder(this).setTitle(item.title)
                     .setItems(opts, (d, w) -> {
                         if (w == 0) {
                             deleteEnrichment(item); // poster + sidecar (blocked flag too)
@@ -2164,7 +2519,9 @@ public class MainActivity extends Activity {
                             saveRw(); buildHome();
                         }
                     })
-                    .setNegativeButton("Cancel", null).show();
+                    .setNegativeButton("Cancel", null).create();
+            trackDialog(rwDlg); // v1.22: phone keys must reach open dialogs too
+            rwDlg.show();
             return true;
         });
         return t;
@@ -2361,7 +2718,7 @@ public class MainActivity extends Activity {
         labels.add(isFav(e) ? "\u2605 Remove from Favorites" : "\u2606 Add to Favorites");
         urls.add("__FAV__");
         labels.add("Copy primary URL"); urls.add("__COPY__");
-        new AlertDialog.Builder(this)
+        AlertDialog entryDlg = new AlertDialog.Builder(this)
                 .setTitle((e.rec ? "\u2605 " : "") + e.name)
                 .setMessage(e.desc + "\n\nCategory: " + catTitle(e.cat) + "  \u2022  " + e.shelf)
                 .setItems(labels.toArray(new CharSequence[0]), (d, which) -> {
@@ -2376,7 +2733,9 @@ public class MainActivity extends Activity {
                         openEntry(m);
                     }
                 })
-                .setNegativeButton("Close", null).show();
+                .setNegativeButton("Close", null).create();
+        trackDialog(entryDlg); // v1.22: phone keys must reach open dialogs too
+        entryDlg.show();
     }
 
     // ---------------------------------------------------------- B: global search
@@ -2577,7 +2936,7 @@ public class MainActivity extends Activity {
         input.setText(prefs.getString(KEY_OMDB, ""));
         input.setSelectAllOnFocus(true);
         input.setHint("Paste OMDb API key (blank removes it)");
-        new AlertDialog.Builder(this)
+        AlertDialog omdbDlg = new AlertDialog.Builder(this)
                 .setTitle("OMDb API key")
                 .setMessage("Free key at omdbapi.com (1,000 lookups/day). Without a key, posters still load; scores need the key.")
                 .setView(input)
@@ -2591,38 +2950,385 @@ public class MainActivity extends Activity {
                             : "OMDb key saved", Toast.LENGTH_SHORT).show();
                 })
                 .setNegativeButton("Cancel", null)
-                .show();
+                .create();
+        trackDialog(omdbDlg); // v1.22: phone keys must reach open dialogs too
+        omdbDlg.show();
     }
 
     // ---------------------------------------------------------- Safari-style browser
 
-    /** Browser toolbar button: white pill, 40dp tall, blue ring when it holds D-pad toolbar focus. */
-    private Button browserBtn(String label) {
-        Button b = new Button(this);
-        b.setText(label); b.setAllCaps(false); b.setTextSize(15);
-        b.setTypeface(tf(false));
-        b.setTextColor(tbText());
-        b.setPadding(dp(14), dp(6), dp(14), dp(6));
-        b.setMinHeight(dp(38)); b.setMinWidth(dp(48));
-        b.setBackground(pillBg(false));
-        b.setFocusable(false); b.setFocusableInTouchMode(false); // keys handled at activity level
-        return b;
+    /**
+     * v1.27: browser toolbar button factory - icon-only buttons
+     * (canvas-drawn icons, no text; names come from the v1.25
+     * tooltips). v1.29: buttons no longer carry their own outlined
+     * circles - they are segments/ghosts inside the floating glass
+     * clusters and capsule, and only the focus state paints a
+     * background (see segmentBg/ghostBg). Sizes are layout params.
+     * Backgrounds are owned by toolbarBg()/styleToolbarFocus().
+     * v1.30: the control is a FrameLayout holding ONE centered
+     * ImageView child. It was a Button whose icon rode as a LEFT
+     * compound drawable, and TextView.onDraw pins that drawable at
+     * x = mPaddingLeft + getHorizontalOffsetForDrawables() (= 0):
+     * vertically centered but hard against the LEFT edge - in a
+     * 48dp segment the 30dp glyph sat 9dp left of center (7dp in
+     * Done's 44dp, 5dp in Reload's 40dp), on every control. That
+     * was Kurt's "icons are shifted left". A gravity-CENTER child
+     * ImageView cannot drift.
+     */
+    private FrameLayout toolbarBtn() {
+        FrameLayout f = new FrameLayout(this);
+        f.setFocusable(false); f.setFocusableInTouchMode(false); // keys handled at activity level
+        ImageView iv = new ImageView(this);
+        iv.setClickable(false);
+        f.addView(iv, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER));
+        return f;
+    }
+
+    /** Tint + attach a drawn icon to a toolbar control's centered ImageView. */
+    private void setBtnIcon(FrameLayout f, BitmapDrawable icon, int tint) {
+        if (icon != null) icon.setColorFilter(tint, PorterDuff.Mode.SRC_IN);
+        ((ImageView) f.getChildAt(0)).setImageDrawable(icon);
+    }
+
+    /**
+     * v1.29: the floating glass surface - a vertical translucent
+     * gradient (lighter at the top edge, the fake-glass sheen), a
+     * 1dp hairline border, and rounded corners. No blur exists on
+     * API 25 (no RenderEffect), so translucency + gradient + a soft
+     * elevation shadow on the view is the whole trick. Focused swaps
+     * the hairline for a 2dp accent ring (used by the address
+     * capsule, the bar's one free-standing glass element).
+     */
+    private GradientDrawable glassBg(int radiusDp, boolean focused) {
+        GradientDrawable g = new GradientDrawable(
+                GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[]{glassTop(), glassBot()});
+        g.setCornerRadius(dp(radiusDp));
+        g.setStroke(focused ? dp(2) : dp(1), focused ? ACCENT : glassBorder());
+        return g;
+    }
+
+    /**
+     * A cluster segment's background: NOTHING at rest (the cluster's
+     * glass is the surface); focused = a translucent highlight fill
+     * + accent ring, inset inside the cluster by its padding, so
+     * the ring can never clip or shift the layout.
+     */
+    private GradientDrawable segmentBg(boolean focused) {
+        GradientDrawable g = new GradientDrawable();
+        g.setCornerRadius(dp(15));
+        if (focused) {
+            g.setColor(focusFill());
+            g.setStroke(dp(2), ACCENT);
+        } else {
+            g.setColor(Color.TRANSPARENT);
+        }
+        return g;
+    }
+
+    /** Reload's background: a ghost inside the address capsule - same rule as a segment, circular. */
+    private GradientDrawable ghostBg(boolean focused) {
+        GradientDrawable g = new GradientDrawable();
+        g.setShape(GradientDrawable.OVAL);
+        if (focused) {
+            g.setColor(focusFill());
+            g.setStroke(dp(2), ACCENT);
+        } else {
+            g.setColor(Color.TRANSPARENT);
+        }
+        return g;
+    }
+
+    /**
+     * The address capsule: glassBg plus a second, fainter fill
+     * inset 3dp inside it (Safari's inner field shading), layered
+     * so the outer layer alone carries the border/focus ring.
+     */
+    private Drawable capsuleBg(boolean focused) {
+        GradientDrawable inset = new GradientDrawable();
+        inset.setColor(capsuleInset());
+        inset.setCornerRadius(dp(19));
+        LayerDrawable ld = new LayerDrawable(
+                new Drawable[]{glassBg(22, focused), inset});
+        ld.setLayerInset(1, dp(3), dp(3), dp(3), dp(3));
+        return ld;
+    }
+
+    /**
+     * Done's background (v1.29 restyle): a restrained red-TINTED
+     * glass circle in BOTH appearances - ~20% red fill, hairline
+     * red-tinted border - so Done belongs to the same material
+     * family as the clusters instead of clashing as a flat solid
+     * disc. Focus strengthens the fill and rings it solid red.
+     */
+    private GradientDrawable doneBg(boolean focused) {
+        GradientDrawable g = new GradientDrawable();
+        g.setShape(GradientDrawable.OVAL);
+        g.setColor(focused ? Color.argb(0x59, 0xFF, 0x45, 0x3A)
+                            : Color.argb(0x33, 0xFF, 0x45, 0x3A)); // ~35% / ~20%
+        g.setStroke(focused ? dp(2) : dp(1),
+                focused ? DONE_RED : Color.argb(0x73, 0xFF, 0x45, 0x3A));
+        return g;
+    }
+
+    /** The one place that knows each toolbar element's background. */
+    private Drawable toolbarBg(View v, boolean focused) {
+        if (v == addrCapsule) return capsuleBg(focused);
+        if (v == tbDone) return doneBg(focused);
+        if (v == tbReload) return ghostBg(focused);
+        return segmentBg(focused);
+    }
+
+    /** v1.29: one segmented glass cluster (Back|Forward or Mode|Phone|Gear). */
+    private LinearLayout glassCluster() {
+        LinearLayout c = new LinearLayout(this);
+        c.setOrientation(LinearLayout.HORIZONTAL);
+        c.setGravity(Gravity.CENTER_VERTICAL);
+        c.setPadding(dp(4), dp(4), dp(4), dp(4));
+        c.setBackground(glassBg(20, false));
+        c.setElevation(dp(4)); // soft shadow - the glass floats
+        return c;
+    }
+
+    /** A 48x44dp segment slot inside a cluster. */
+    private LinearLayout.LayoutParams segmentLp() {
+        return new LinearLayout.LayoutParams(dp(48), dp(44));
+    }
+
+    /** Hairline divider between two cluster segments. */
+    private View clusterDivider() {
+        View d = new View(this);
+        d.setBackgroundColor(glassDivider());
+        tbDividers.add(d);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(1), dp(24));
+        lp.leftMargin = dp(2); lp.rightMargin = dp(2);
+        d.setLayoutParams(lp);
+        return d;
+    }
+
+    /** Re-tint the drawn toolbar icons for the current appearance (Done stays red). */
+    private void retintToolbarIcons() {
+        int t = tbText();
+        if (backIcon != null) backIcon.setColorFilter(t, PorterDuff.Mode.SRC_IN);
+        if (fwdIcon != null) fwdIcon.setColorFilter(t, PorterDuff.Mode.SRC_IN);
+        if (reloadIcon != null) reloadIcon.setColorFilter(t, PorterDuff.Mode.SRC_IN);
+        if (gearIcon != null) gearIcon.setColorFilter(t, PorterDuff.Mode.SRC_IN);
+        if (doneIcon != null) doneIcon.setColorFilter(DONE_RED, PorterDuff.Mode.SRC_IN);
+    }
+
+    /**
+     * Back/Forward dim with history state: full-strength icon when
+     * the direction is available, faded when it is not. Called from
+     * setUrlPillText, which every navigation update funnels through
+     * (page start/finish, pushState, entry open, resume restore).
+     */
+    private void refreshNavIcons() {
+        if (webView == null) return;
+        if (backIcon != null) backIcon.setAlpha(webView.canGoBack() ? 255 : 90);
+        if (fwdIcon != null) fwdIcon.setAlpha(webView.canGoForward() ? 255 : 90);
+    }
+
+    /**
+     * v1.25: draw one stroke-style toolbar icon into a Bitmap, in
+     * white; callers tint the returned drawable with a PorterDuff
+     * SRC_IN color filter. Runtime-drawn because neither the bundled
+     * Inter font nor the Fire OS system fonts can be trusted to
+     * carry mouse/phone glyphs. v1.27: canvas is 30dp (glyphs render
+     * ~26-28dp inside the 48-52dp circular buttons) and the set grew:
+     * "back", "fwd", "reload", "gear", "done" join "mouse", "dpad",
+     * "phone".
+     */
+    private BitmapDrawable strokeIcon(String kind) {
+        int s = dp(30);
+        Bitmap bmp = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888);
+        Canvas c = new Canvas(bmp);
+        // v1.28 (Part 2): the whole set redrawn to SF Symbols
+        // discipline - strokes ~0.07-0.075 of the canvas (v1.27 used
+        // 0.13-0.15, which read chunky at TV distance and turned the
+        // gear into a sun), glyph ~70% of the canvas, round caps and
+        // joins. The numbers below were verified BEFORE porting by
+        // rendering the identical geometry in a Python/PIL prototype
+        // at button scale: gear = option (b), 8 fat arc segments
+        // (the "dashed ring") over a ring + hub; reload's head uses
+        // the same construction as the remote page's arrows - tip
+        // exactly at the arc endpoint, base behind it along the arc.
+        Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        p.setStyle(Paint.Style.STROKE);
+        p.setStrokeWidth(s * 0.072f);
+        p.setStrokeCap(Paint.Cap.ROUND);
+        p.setStrokeJoin(Paint.Join.ROUND);
+        p.setColor(Color.WHITE);
+        Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
+        fill.setStyle(Paint.Style.FILL);
+        fill.setColor(Color.WHITE);
+        float cx = s / 2f, cy = s / 2f;
+        if ("mouse".equals(kind)) {
+            // Slimmer body; wheel = short dash; the divider is
+            // butt-capped and inset - with round caps at full width
+            // it poked nubs outside the body outline.
+            RectF body = new RectF(s * 0.315f, s * 0.09f, s * 0.685f, s * 0.91f);
+            c.drawRoundRect(body, s * 0.17f, s * 0.17f, p);
+            c.drawLine(cx, s * 0.215f, cx, s * 0.315f, p);
+            Paint dv = new Paint(Paint.ANTI_ALIAS_FLAG);
+            dv.setStyle(Paint.Style.STROKE);
+            dv.setStrokeWidth(s * 0.045f);
+            dv.setStrokeCap(Paint.Cap.BUTT);
+            dv.setColor(Color.WHITE);
+            c.drawLine(s * 0.325f, s * 0.335f, s * 0.675f, s * 0.335f, dv);
+        } else if ("dpad".equals(kind)) {
+            // One plus-outline path (arm half-width 0.105, span
+            // 0.155-0.845) + a small filled center dot; replaces the
+            // two-overlapping-rounded-rects cross.
+            float aw = s * 0.105f, lo = s * 0.155f, hi = s * 0.845f;
+            Path plus = new Path();
+            plus.moveTo(cx - aw, lo);
+            plus.lineTo(cx + aw, lo);
+            plus.lineTo(cx + aw, cy - aw);
+            plus.lineTo(hi, cy - aw);
+            plus.lineTo(hi, cy + aw);
+            plus.lineTo(cx + aw, cy + aw);
+            plus.lineTo(cx + aw, hi);
+            plus.lineTo(cx - aw, hi);
+            plus.lineTo(cx - aw, cy + aw);
+            plus.lineTo(lo, cy + aw);
+            plus.lineTo(lo, cy - aw);
+            plus.lineTo(cx - aw, cy - aw);
+            plus.close();
+            Paint pp = new Paint(p);
+            pp.setStrokeWidth(s * 0.07f);
+            c.drawPath(plus, pp);
+            c.drawCircle(cx, cy, s * 0.042f, fill);
+        } else if ("back".equals(kind) || "fwd".equals(kind)) {
+            // SF chevron proportions: tall and narrow
+            // (0.64, 0.18) -> (0.36, 0.50) -> (0.64, 0.82).
+            // v1.30: nudged +0.02 from the v1.28 numbers so the
+            // ink's bounding box is exactly canvas-centered
+            // ((0.36-0.0375 + 0.64+0.0375) / 2 = 0.50).
+            Paint cp = new Paint(p);
+            cp.setStrokeWidth(s * 0.075f);
+            Path path = new Path();
+            if ("back".equals(kind)) {
+                path.moveTo(s * 0.64f, s * 0.18f);
+                path.lineTo(s * 0.36f, s * 0.50f);
+                path.lineTo(s * 0.64f, s * 0.82f);
+            } else {
+                path.moveTo(s * 0.36f, s * 0.18f);
+                path.lineTo(s * 0.64f, s * 0.50f);
+                path.lineTo(s * 0.36f, s * 0.82f);
+            }
+            c.drawPath(path, cp);
+        } else if ("reload".equals(kind)) {
+            // v1.30: canonical circular-arrow construction, verified
+            // in real renders BEFORE porting (the exact canvas calls
+            // replicated in PIL): the arc is drawn only as far as
+            // the head's BASE CENTER and the filled head grows out
+            // of that point - tip on the circle at 300 deg, base
+            // center 0.50 rad back along the arc, base corners
+            // radial at +-0.289r. The v1.28/29 version ran a
+            // 300-degree arc UNDER a narrow head (base ~1.2x the
+            // stroke): on device it rendered as a thorn, not a tip.
+            Paint rp = new Paint(p);
+            rp.setStrokeWidth(s * 0.08f);
+            rp.setStrokeCap(Paint.Cap.BUTT);
+            RectF oval = new RectF(s * 0.185f, s * 0.185f, s * 0.815f, s * 0.815f);
+            float r = s * 0.315f;
+            double end = Math.toRadians(300);
+            double bk = end - 0.50; // head length 0.50 * r, as radians of arc
+            c.drawArc(oval, 50f, (float) (Math.toDegrees(bk) - 50.0), false, rp);
+            float ex = cx + (float) (r * Math.cos(end));
+            float ey = cy + (float) (r * Math.sin(end));
+            float bx = cx + (float) (r * Math.cos(bk));
+            float by = cy + (float) (r * Math.sin(bk));
+            float hb = r * 0.289f; // half the base width
+            float nx = (float) Math.cos(bk), ny = (float) Math.sin(bk);
+            Path head = new Path();
+            head.moveTo(ex, ey);
+            head.lineTo(bx + nx * hb, by + ny * hb);
+            head.lineTo(bx - nx * hb, by - ny * hb);
+            head.close();
+            c.drawPath(head, fill);
+        } else if ("gear".equals(kind)) {
+            // Dashed-ring teeth: 8 arc segments of 20 degrees on
+            // r=0.395 with a 0.13 stroke (band 0.33-0.46), over a
+            // stroked ring r=0.295 (its outer edge meets the band)
+            // and a filled hub r=0.095. The PIL prototype picked
+            // this over trapezoid teeth: it reads as a gear at
+            // 48dp on a TV; radial-line teeth read as a sun.
+            Paint tp = new Paint(Paint.ANTI_ALIAS_FLAG);
+            tp.setStyle(Paint.Style.STROKE);
+            tp.setStrokeWidth(s * 0.13f);
+            tp.setStrokeCap(Paint.Cap.BUTT);
+            tp.setColor(Color.WHITE);
+            RectF teeth = new RectF(s * 0.105f, s * 0.105f, s * 0.895f, s * 0.895f);
+            for (int i = 0; i < 8; i++)
+                c.drawArc(teeth, i * 45f - 10f, 20f, false, tp);
+            Paint rp = new Paint(p);
+            rp.setStrokeWidth(s * 0.07f);
+            c.drawCircle(cx, cy, s * 0.295f, rp);
+            c.drawCircle(cx, cy, s * 0.095f, fill);
+        } else if ("done".equals(kind)) {
+            // X matched to the new set; the RED comes from the tint
+            // the caller applies (this bitmap stays white).
+            Paint xp = new Paint(p);
+            xp.setStrokeWidth(s * 0.09f);
+            c.drawLine(s * 0.335f, s * 0.335f, s * 0.665f, s * 0.665f, xp);
+            c.drawLine(s * 0.665f, s * 0.335f, s * 0.335f, s * 0.665f, xp);
+        } else { // "phone": slimmer outline, smaller speaker + dot
+            RectF body = new RectF(s * 0.295f, s * 0.075f, s * 0.705f, s * 0.925f);
+            c.drawRoundRect(body, s * 0.085f, s * 0.085f, p);
+            Paint sp = new Paint(p);
+            sp.setStrokeWidth(s * 0.055f);
+            c.drawLine(cx - s * 0.06f, s * 0.165f, cx + s * 0.06f, s * 0.165f, sp);
+            c.drawCircle(cx, s * 0.83f, s * 0.03f, fill);
+        }
+        return new BitmapDrawable(getResources(), bmp);
+    }
+
+    /**
+     * v1.25: the Mode button's icon follows the SAME state rule the
+     * old text label followed: it names the CURRENT sub-mode
+     * (mouse icon while browserMouse is on, D-pad cross while off).
+     */
+    private void updateModeBtn() {
+        if (tbMode == null) return;
+        BitmapDrawable icon = browserMouse ? modeMouseIcon : modeDpadIcon;
+        if (icon != null) setBtnIcon(tbMode, icon, tbText()); // v1.30: centered ImageView child
+        tbMode.setContentDescription(browserMouse ? "Mouse" : "D-pad");
+        // Keep an already-visible tooltip on this button truthful
+        // across a mode flip (the flip usually comes from a click,
+        // which hides the tip first - this is just belt and braces).
+        if (toolbarTipTarget == tbMode && toolbarTipView != null
+                && toolbarTipView.getVisibility() == View.VISIBLE)
+            toolbarTipView.setText(toolbarTipText(tbMode));
     }
 
     private void styleToolbarFocus() {
         for (int i = 0; i < toolbarViews.size(); i++) {
             View v = toolbarViews.get(i);
             boolean foc = toolbarFocus && i == toolbarIndex;
-            if (v == urlPill) {
-                urlPill.setBackground(pillBg(foc));
-            } else if (v instanceof Button) {
-                v.setBackground(pillBg(foc));
-            }
+            // v1.27: per-element backgrounds (URL pill / red Done /
+            // circular buttons) come from the one toolbarBg() helper.
+            v.setBackground(toolbarBg(v, foc));
             // v1.3: no scale transform on toolbar buttons - a growing
             // button pushed its outline past the bar/screen edge and
             // the stroke got clipped (shown in a device screenshot). Focus is
-            // shown by the thicker blue ring (pillBg) only.
+            // shown by the accent ring in toolbarBg() only.
             v.animate().scaleX(1f).scaleY(1f).setDuration(100).start();
+        }
+        // v1.25: D-pad toolbar focus also raises the name bubble for
+        // the focused element (two buttons are icon-only now). A
+        // 150ms dwell keeps fast LEFT/RIGHT runs from flashing it;
+        // losing toolbar focus hides it. In mouse sub-mode
+        // toolbarFocus is never set, so hover tips (driven from
+        // moveCursor) are unaffected in practice.
+        if (toolbarFocus && !browserMouse && currentScreen == browserPane
+                && fsView == null && toolbarIndex >= 0
+                && toolbarIndex < toolbarViews.size()) {
+            scheduleToolbarTip(toolbarViews.get(toolbarIndex), 150);
+        } else if (!browserMouse) {
+            hideToolbarTip();
         }
     }
 
@@ -2638,52 +3344,160 @@ public class MainActivity extends Activity {
         // block so the whole header can slide away on scroll-down and
         // the WebView expands into the freed height (Safari-style).
         headerBlock = new LinearLayout(this); headerBlock.setOrientation(LinearLayout.VERTICAL);
-        browserBar = new LinearLayout(this);
-        LinearLayout bar = browserBar; bar.setOrientation(LinearLayout.HORIZONTAL);
-        bar.setGravity(Gravity.CENTER_VERTICAL);
-        // v1.3 clipping fix: >=16dp side padding + compact buttons +
-        // the weighted URL pill below guarantee every outline (incl.
-        // Done at the far right) renders fully inside the display.
-        bar.setBackgroundColor(tbBg()); bar.setPadding(dp(16), dp(8), dp(16), dp(8));
+        // v1.29: the header block is only the floating bar's
+        // positioning frame - transparent, inset from the screen
+        // edges (20dp sides, 12dp top), no slab behind the glass.
+        headerBlock.setPadding(dp(20), dp(12), dp(20), dp(8));
+        unclip(headerBlock);
+        browserBar = new FrameLayout(this);
+        FrameLayout bar = browserBar;
+        bar.setBackgroundColor(Color.TRANSPARENT);
+        unclip(bar);
 
-        tbBack = browserBtn("\u2039"); tbBack.setOnClickListener(v -> { if (webView.canGoBack()) webView.goBack(); });
-        tbFwd = browserBtn("\u203A"); tbFwd.setOnClickListener(v -> { if (webView.canGoForward()) webView.goForward(); });
-        // URL is a BUTTON (pill), not an EditText: D-pad focus lands on it
-        // as one stop; clicking opens the URL editor dialog.
+        // v1.29 toolbar: ONE floating glass bar, three integrated
+        // clusters, no per-button circles. LEFT: a segmented capsule
+        // Back | Forward. CENTER (held screen-centered by equal-
+        // weight spacers): the address capsule - host on top, page
+        // title as a quiet second line, Reload a ghost inside its
+        // trailing edge. RIGHT: a segmented capsule Mode | Phone |
+        // Gear, then Done as a red-tinted glass circle. The 8 stops
+        // and their order are unchanged from v1.27; every icon is
+        // still canvas-drawn (strokeIcon) - no font glyphs.
+        tbBack = toolbarBtn();
+        backIcon = strokeIcon("back");
+        setBtnIcon(tbBack, backIcon, tbText());
+        tbBack.setContentDescription("Back");
+        tbBack.setOnClickListener(v -> { if (webView.canGoBack()) webView.goBack(); });
+        tbFwd = toolbarBtn();
+        fwdIcon = strokeIcon("fwd");
+        setBtnIcon(tbFwd, fwdIcon, tbText());
+        tbFwd.setContentDescription("Forward");
+        tbFwd.setOnClickListener(v -> { if (webView.canGoForward()) webView.goForward(); });
+        // URL is a BUTTON (the address capsule), not an EditText:
+        // D-pad focus lands on it as one stop; clicking opens the
+        // URL editor dialog (which pre-fills the FULL current URL
+        // from the WebView, not the host shown here - see
+        // openUrlDialog / setUrlPillText). v1.29: the capsule holds
+        // TWO lines - the host (15sp semibold) and, under it, the
+        // page title (11sp secondary) - so the separate title strip
+        // under the bar is gone. Side padding keeps the centered
+        // text clear of Reload's ghost slot at the trailing edge.
         urlPill = new TextView(this);
-        urlPill.setSingleLine(true); urlPill.setTextSize(14); urlPill.setTextColor(tbText());
-        urlPill.setTypeface(tf(false));
+        urlPill.setSingleLine(true); urlPill.setTextSize(15); urlPill.setTextColor(tbText());
+        urlPill.setTypeface(fontSemi != null ? fontSemi : tf(true));
         urlPill.setGravity(Gravity.CENTER); urlPill.setEllipsize(TextUtils.TruncateAt.END);
         urlPill.setText("Search or enter website name");
-        urlPill.setPadding(dp(16), dp(9), dp(16), dp(9));
-        urlPill.setMinHeight(dp(40));
-        urlPill.setBackground(pillBg(false));
         urlPill.setFocusable(false); urlPill.setFocusableInTouchMode(false);
         urlPill.setOnClickListener(v -> openUrlDialog());
-        tbReload = browserBtn("\u21BB"); tbReload.setOnClickListener(v -> webView.reload());
-        tbMode = browserBtn(browserMouse ? "Mouse" : "D-pad"); // short label: toolbar must fit the width
+        browserTitle = tv("", 11, tbSecondary(), false);
+        browserTitle.setSingleLine(true); browserTitle.setEllipsize(TextUtils.TruncateAt.END);
+        browserTitle.setGravity(Gravity.CENTER);
+        browserTitle.setBackgroundColor(Color.TRANSPARENT);
+        browserTitle.setPadding(0, dp(2), 0, 0);
+        tbReload = toolbarBtn();
+        reloadIcon = strokeIcon("reload");
+        setBtnIcon(tbReload, reloadIcon, tbText());
+        tbReload.setContentDescription("Reload");
+        tbReload.setOnClickListener(v -> webView.reload());
+        // v1.25: Mode is an ICON button (was the text "Mouse"/"D-pad").
+        // The icon follows the label's state rule - it shows the
+        // CURRENT sub-mode - and updateModeBtn() owns icon + tint.
+        tbMode = toolbarBtn();
+        modeMouseIcon = strokeIcon("mouse");
+        modeDpadIcon = strokeIcon("dpad");
         tbMode.setOnClickListener(v -> setBrowserMouse(!browserMouse, true));
-        tbGear = browserBtn("\u2699"); tbGear.setOnClickListener(v -> openBrowserSettings());
-        tbDone = browserBtn("\u2715 Done"); tbDone.setOnClickListener(v -> closeBrowser());
+        updateModeBtn();
+        // v1.20: Phone button opens the v1.19 pairing panel; its
+        // label tinted accent while a phone is paired. v1.25: it is
+        // an icon button too (canvas-drawn smartphone - bundled
+        // Inter has no trustworthy phone glyph on Fire OS), and
+        // refreshPhoneBtn() now tints the icon instead.
+        tbPhone = toolbarBtn();
+        phoneIconDrawable = strokeIcon("phone");
+        setBtnIcon(tbPhone, phoneIconDrawable, tbText()); // v1.30: centered ImageView child
+        tbPhone.setContentDescription("Phone");
+        tbPhone.setOnClickListener(v -> openRemotePanel());
+        tbGear = toolbarBtn();
+        gearIcon = strokeIcon("gear");
+        setBtnIcon(tbGear, gearIcon, tbText());
+        tbGear.setContentDescription("Settings");
+        tbGear.setOnClickListener(v -> openBrowserSettings());
+        // v1.27: Done loses its text: a red X on a translucent red
+        // circle (doneBg), red in both appearances.
+        tbDone = toolbarBtn();
+        doneIcon = strokeIcon("done");
+        setBtnIcon(tbDone, doneIcon, DONE_RED);
+        tbDone.setContentDescription("Done");
+        tbDone.setOnClickListener(v -> closeBrowser());
+
+        // The capsule replaces urlPill as the URL focus stop; the
+        // stop ORDER is unchanged: Back, Forward, URL, Reload,
+        // Mode, Phone, Gear, Done.
+        addrCapsule = new FrameLayout(this);
+        addrCapsule.setOnClickListener(v -> openUrlDialog());
+        addrCapsule.setElevation(dp(4));
+        LinearLayout addrText = new LinearLayout(this);
+        addrText.setOrientation(LinearLayout.VERTICAL);
+        addrText.setGravity(Gravity.CENTER);
+        addrText.setPadding(dp(50), 0, dp(50), 0); // clear of Reload's slot
+        addrText.addView(urlPill, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        addrText.addView(browserTitle, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        addrCapsule.addView(addrText, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        FrameLayout.LayoutParams reloadLp = new FrameLayout.LayoutParams(dp(40), dp(40));
+        reloadLp.gravity = Gravity.RIGHT | Gravity.CENTER_VERTICAL;
+        reloadLp.rightMargin = dp(8);
+        addrCapsule.addView(tbReload, reloadLp);
 
         toolbarViews.clear();
-        toolbarViews.add(tbBack); toolbarViews.add(tbFwd); toolbarViews.add(urlPill);
-        toolbarViews.add(tbReload); toolbarViews.add(tbMode); toolbarViews.add(tbGear); toolbarViews.add(tbDone);
-        bar.addView(tbBack, gapLp(true));
-        bar.addView(tbFwd, gapLp(false));
-        LinearLayout.LayoutParams urlLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-        urlLp.setMargins(dp(12), 0, 0, 0);
-        bar.addView(urlPill, urlLp);
-        bar.addView(tbReload, gapLp(false));
-        bar.addView(tbMode, gapLp(false));
-        bar.addView(tbGear, gapLp(false));
-        bar.addView(tbDone, gapLp(false));
-        headerBlock.addView(bar);
+        toolbarViews.add(tbBack); toolbarViews.add(tbFwd); toolbarViews.add(addrCapsule);
+        toolbarViews.add(tbReload); toolbarViews.add(tbMode); toolbarViews.add(tbPhone);
+        toolbarViews.add(tbGear); toolbarViews.add(tbDone);
+        // v1.30: the bar is a FrameLayout so the address capsule is
+        // centered by gravity, exactly. The v1.29 LinearLayout used
+        // two equal-weight spacers, but the flanks are NOT equal
+        // (left cluster 109dp vs right cluster + Done 216dp), which
+        // parked the capsule - and everything in it - ~53dp left of
+        // center at 1080p. Now: nav cluster pinned LEFT, capsule at
+        // Gravity.CENTER, right cluster + Done pinned RIGHT.
+        // LEFT cluster: Back | Forward
+        navCluster = glassCluster();
+        navCluster.addView(tbBack, segmentLp());
+        navCluster.addView(clusterDivider());
+        navCluster.addView(tbFwd, segmentLp());
+        bar.addView(navCluster, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(52),
+                Gravity.LEFT | Gravity.CENTER_VERTICAL));
+        bar.addView(addrCapsule, new FrameLayout.LayoutParams(
+                dp(460), dp(56), Gravity.CENTER));
+        // RIGHT cluster: Mode | Phone | Gear, then Done.
+        rightCluster = glassCluster();
+        rightCluster.addView(tbMode, segmentLp());
+        rightCluster.addView(clusterDivider());
+        rightCluster.addView(tbPhone, segmentLp());
+        rightCluster.addView(clusterDivider());
+        rightCluster.addView(tbGear, segmentLp());
+        LinearLayout rightSide = new LinearLayout(this);
+        rightSide.setOrientation(LinearLayout.HORIZONTAL);
+        rightSide.setGravity(Gravity.CENTER_VERTICAL);
+        rightSide.addView(rightCluster, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(52)));
+        tbDone.setStateListAnimator(null); // keep the elevation shadow steady
+        tbDone.setElevation(dp(4));
+        LinearLayout.LayoutParams doneLp = new LinearLayout.LayoutParams(dp(44), dp(44));
+        doneLp.leftMargin = dp(10);
+        rightSide.addView(tbDone, doneLp);
+        bar.addView(rightSide, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(52),
+                Gravity.RIGHT | Gravity.CENTER_VERTICAL));
+        headerBlock.addView(bar, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(64)));
+        // Creation-time backgrounds (styleToolbarFocus re-applies
+        // them with focus state on every browser open).
+        for (View v : toolbarViews) v.setBackground(toolbarBg(v, false));
 
-        browserTitle = tv("", 12, browserDark() ? DIM : Color.parseColor("#8E8E93"), false);
-        browserTitle.setGravity(Gravity.CENTER); browserTitle.setBackgroundColor(tbBg());
-        browserTitle.setPadding(dp(10), dp(2), dp(10), dp(7));
-        headerBlock.addView(browserTitle);
         pageProgress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         pageProgress.setMax(100); pageProgress.setVisibility(View.GONE);
         try { pageProgress.setProgressTintList(ColorStateList.valueOf(ACCENT)); } catch (Exception ignored) {}
@@ -2697,6 +3511,36 @@ public class MainActivity extends Activity {
         root.addView(browserCol, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
+        // (v1.28: the auto pairing prompt at browser start is the
+        // themed CARD built below - the v1.27 auto AlertDialog and
+        // the v1.20 hint bubble before it are both gone.)
+
+        // v1.25: toolbar name bubble (hover / D-pad focus tooltips).
+        // Same visual family as the retired pair tip; renders above
+        // the WebView, still below the decor-level cursor overlay.
+        // Non-clickable/non-focusable.
+        toolbarTipView = new TextView(this);
+        toolbarTipView.setTextSize(13); toolbarTipView.setTextColor(Color.WHITE);
+        toolbarTipView.setTypeface(tf(false));
+        toolbarTipView.setPadding(dp(12), dp(6), dp(12), dp(6));
+        GradientDrawable tbTipBg = new GradientDrawable();
+        tbTipBg.setColor(Color.parseColor("#2C2C2E"));
+        tbTipBg.setCornerRadius(dp(8));
+        tbTipBg.setStroke(dp(1), Color.parseColor("#48484A"));
+        toolbarTipView.setBackground(tbTipBg);
+        toolbarTipView.setClickable(false);
+        toolbarTipView.setFocusable(false); toolbarTipView.setFocusableInTouchMode(false);
+        toolbarTipView.setVisibility(View.GONE);
+        FrameLayout.LayoutParams tbTipLp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        tbTipLp.gravity = Gravity.TOP | Gravity.LEFT;
+        root.addView(toolbarTipView, tbTipLp);
+
+        // v1.28: the auto pairing CARD - same overlay layer as the
+        // tooltip (above the WebView, below the decor-level cursor
+        // and feedback overlays), anchored top-right at show time.
+        buildPairCard(root);
+
         // fsContainer is NOT created here anymore (v1.2): it is attached
         // to the window's decorView in buildUi() so fullscreen video can
         // cover the entire display.
@@ -2704,8 +3548,21 @@ public class MainActivity extends Activity {
     }
 
     private void trackDialog(AlertDialog d) {
-        d.setOnShowListener(x -> browserDialogDepth++);
-        d.setOnDismissListener(x -> { if (browserDialogDepth > 0) browserDialogDepth--; });
+        trackDialog(d, null);
+    }
+
+    private void trackDialog(AlertDialog d, Runnable dismissedExtra) {
+        d.setOnShowListener(x -> { browserDialogDepth++; openDialog = d; hideToolbarTip(); hidePairCardNow(); refreshCursor("dialog-show"); }); // v1.22: openDialog; v1.25: no tooltip under a dialog; v1.28: no pairing card under one either; v1.32: cursor re-asserted across dialog transitions
+        d.setOnDismissListener(x -> {
+            if (openDialog == d) openDialog = null; // v1.22
+            if (browserDialogDepth > 0) browserDialogDepth--;
+            if (dismissedExtra != null) dismissedExtra.run();
+            refreshCursor("dialog-dismiss"); // v1.32
+            // v1.21: the LAST browser dialog closing is one of
+            // the moments the video surface can be left black -
+            // revive it with a 1px layout kick (gated inside).
+            if (browserDialogDepth == 0) ui.post(() -> kickVideoLayer("dialog"));
+        });
     }
 
     /** WebView that reports scroll changes (v1.4 auto-hiding header). */
@@ -2737,10 +3594,11 @@ public class MainActivity extends Activity {
     private void hideHeader() {
         if (headerHidden || headerBlock == null) return;
         headerHidden = true;
+        hideToolbarTip(); // v1.25: the bar it names is going away
         scrollAccum = 0;
         // Toolbar focus cannot live in a hidden bar.
         toolbarFocus = false; styleToolbarFocus();
-        int h = headerBlock.getHeight() > 0 ? headerBlock.getHeight() : dp(100);
+        int h = headerBlock.getHeight() > 0 ? headerBlock.getHeight() : dp(88);
         headerBlock.animate().cancel();
         headerBlock.animate().translationY(-h).alpha(0f).setDuration(180)
                 .withEndAction(() -> {
@@ -2763,7 +3621,7 @@ public class MainActivity extends Activity {
         scrollAccum = 0;
         headerBlock.setVisibility(View.VISIBLE);
         if (animate) {
-            float h = headerBlock.getHeight() > 0 ? headerBlock.getHeight() : dp(100);
+            float h = headerBlock.getHeight() > 0 ? headerBlock.getHeight() : dp(88);
             headerBlock.setTranslationY(-h); headerBlock.setAlpha(0f);
             headerBlock.animate().translationY(0).alpha(1f).setDuration(180).start();
         } else {
@@ -2916,8 +3774,535 @@ public class MainActivity extends Activity {
 
     private RemoteServer remoteServer;
     private boolean remoteHeartbeatOn = false;
+    private int lastRemotePairedCount = 0; // v1.21: for the 0 -> >0 pair transition
     private String remoteNote; // one-shot note carried by the next state push
     private TextView remotePairCountView; // live label inside the pairing panel, if open
+
+    // v1.28: auto pairing CARD. Same trigger semantics as the
+    // v1.27 auto popup (once per browser session, 700ms after
+    // browser entry, only when no phone is paired, 15s countdown
+    // since v1.32 - see PAIR_CARD_MS),
+    // but rendered as a themed IN-WINDOW card in the browser pane
+    // - top-right, below the header - instead of the stock-gray
+    // AlertDialog the v1.27 photo showed. Because the card is a
+    // plain view (not a dialog window), showing/hiding it cannot
+    // disturb a playing video's surface (the v1.21 videokick class
+    // does not apply) and it never touches browserDialogDepth.
+    // The manual pairing panel (openRemotePanel) is unchanged;
+    // opening it supersedes the card. The card is non-focusable:
+    // in D-pad mode its CENTER/BACK handling is intercepted at the
+    // activity key level in dispatchKeyEvent, and in mouse mode
+    // taps are claimed in dispatchTap/dispatchLongTap.
+    private boolean autoPairShownThisSession = false; // reset in closeBrowser
+    private LinearLayout pairCard;
+    private GradientDrawable pairCardBg, pairCardTrackBg;
+    private TextView pairCardLabel, pairCardTitle, pairCardBody,
+            pairCardAddr, pairCardPinTag, pairCardPinDigits, pairCardCount;
+    private LinearLayout pairCardPinRow;
+    private FrameLayout pairCardQrTile;
+    private ImageView pairCardQr;
+    private View pairCardProgressFill;
+    private boolean pairCardVisible = false;
+    private int pairCardSecondsLeft = 0;
+    private int pairCardGen = 0; // invalidates stale delayed hides
+    private ValueAnimator pairCardDrain;
+    // v1.32: the card's auto-close window, 10s -> 15s (Kurt).
+    // ONE constant: the drain animator's duration and the
+    // "Closes in Ns" counter both derive from it, on the show
+    // path and on every countdown restart (pairCardAction).
+    private static final long PAIR_CARD_MS = 15000;
+
+    private final Runnable autoPairShowRunnable = new Runnable() {
+        @Override public void run() {
+            // The flag is CONSUMED even when re-validation fails:
+            // a session that goes fullscreen (or into a dialog)
+            // inside the 700ms window does not get a late card
+            // after it comes back.
+            if (autoPairShownThisSession) return;
+            autoPairShownThisSession = true;
+            if (currentScreen != browserPane || fsView != null) return;
+            if (browserDialogDepth > 0) return;
+            if (pairedCount() > 0) return;
+            showPairCard();
+        }
+    };
+    private final Runnable pairCardTickRunnable = new Runnable() {
+        @Override public void run() {
+            if (!pairCardVisible) return;
+            pairCardSecondsLeft--;
+            if (pairCardSecondsLeft <= 0) { hidePairCard(); return; }
+            updatePairCardCountdownText();
+            ui.postDelayed(this, 1000);
+        }
+    };
+
+    /** Schedule the auto pairing card for a fresh browser session. */
+    private void maybeAutoPairPopup() {
+        if (autoPairShownThisSession) return;
+        if (pairedCount() > 0) return;
+        ui.removeCallbacks(autoPairShowRunnable);
+        ui.postDelayed(autoPairShowRunnable, 700);
+    }
+
+    /** Cancel any pending auto card and hide a visible one (screen change / browser exit / fullscreen). */
+    private void cancelAutoPairPopup() {
+        ui.removeCallbacks(autoPairShowRunnable);
+        hidePairCardNow();
+    }
+
+    private boolean remoteOn() {
+        return remoteServer != null && remoteServer.isRunning();
+    }
+
+    /** Build the card into the browser pane root (above the WebView, below the cursor). */
+    private void buildPairCard(FrameLayout root) {
+        pairCard = new LinearLayout(this);
+        pairCard.setOrientation(LinearLayout.VERTICAL);
+        pairCard.setPadding(dp(18), dp(14), dp(18), dp(14));
+        pairCardBg = new GradientDrawable();
+        pairCardBg.setCornerRadius(dp(18));
+        pairCard.setBackground(pairCardBg);
+        pairCard.setClickable(false);
+        pairCard.setFocusable(false);
+        pairCard.setFocusableInTouchMode(false);
+        pairCard.setVisibility(View.GONE);
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+
+        pairCardLabel = new TextView(this);
+        pairCardLabel.setText("PHONE REMOTE");
+        pairCardLabel.setTextSize(11);
+        pairCardLabel.setTypeface(tf(true));
+        try { pairCardLabel.setLetterSpacing(0.14f); } catch (Exception ignored) {}
+        col.addView(pairCardLabel);
+
+        pairCardTitle = new TextView(this);
+        pairCardTitle.setTextSize(19);
+        pairCardTitle.setTypeface(tf(true));
+        LinearLayout.LayoutParams titleLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        titleLp.topMargin = dp(3);
+        col.addView(pairCardTitle, titleLp);
+
+        pairCardBody = new TextView(this);
+        pairCardBody.setTextSize(13.5f);
+        pairCardBody.setTypeface(tf(false));
+        LinearLayout.LayoutParams bodyLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        bodyLp.topMargin = dp(4);
+        col.addView(pairCardBody, bodyLp);
+
+        pairCardAddr = new TextView(this);
+        pairCardAddr.setTextSize(14);
+        pairCardAddr.setTypeface(Typeface.MONOSPACE);
+        LinearLayout.LayoutParams addrLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        addrLp.topMargin = dp(6);
+        col.addView(pairCardAddr, addrLp);
+
+        pairCardPinRow = new LinearLayout(this);
+        pairCardPinRow.setOrientation(LinearLayout.HORIZONTAL);
+        pairCardPinRow.setGravity(Gravity.BOTTOM);
+        pairCardPinTag = new TextView(this);
+        pairCardPinTag.setText("PIN");
+        pairCardPinTag.setTextSize(12);
+        pairCardPinTag.setTypeface(tf(true));
+        pairCardPinRow.addView(pairCardPinTag);
+        pairCardPinDigits = new TextView(this);
+        pairCardPinDigits.setTextSize(24);
+        pairCardPinDigits.setTypeface(tf(true));
+        pairCardPinDigits.setTextColor(ACCENT);
+        LinearLayout.LayoutParams digLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        digLp.leftMargin = dp(10);
+        pairCardPinRow.addView(pairCardPinDigits, digLp);
+        LinearLayout.LayoutParams pinLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        pinLp.topMargin = dp(6);
+        col.addView(pairCardPinRow, pinLp);
+
+        row.addView(col, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        pairCardQrTile = new FrameLayout(this);
+        GradientDrawable tileBg = new GradientDrawable();
+        tileBg.setColor(Color.WHITE); // QR quiet zone: always white, both appearances
+        tileBg.setCornerRadius(dp(10));
+        pairCardQrTile.setBackground(tileBg);
+        pairCardQrTile.setPadding(dp(6), dp(6), dp(6), dp(6));
+        pairCardQr = new ImageView(this);
+        pairCardQrTile.addView(pairCardQr,
+                new FrameLayout.LayoutParams(dp(92), dp(92)));
+        LinearLayout.LayoutParams tileLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        tileLp.leftMargin = dp(14);
+        row.addView(pairCardQrTile, tileLp);
+        pairCard.addView(row);
+
+        pairCardCount = new TextView(this);
+        pairCardCount.setTextSize(12);
+        pairCardCount.setTypeface(tf(false));
+        LinearLayout.LayoutParams countLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        countLp.topMargin = dp(12);
+        pairCard.addView(pairCardCount, countLp);
+
+        // The countdown made visual: a 3dp accent track under the
+        // content, drained full -> 0 over PAIR_CARD_MS by a
+        // ValueAnimator (the text above it ticks per second).
+        FrameLayout track = new FrameLayout(this);
+        pairCardTrackBg = new GradientDrawable();
+        pairCardTrackBg.setCornerRadius(dp(2));
+        track.setBackground(pairCardTrackBg);
+        pairCardProgressFill = new View(this);
+        GradientDrawable fillBg = new GradientDrawable();
+        fillBg.setColor(ACCENT);
+        fillBg.setCornerRadius(dp(2));
+        pairCardProgressFill.setBackground(fillBg);
+        pairCardProgressFill.setPivotX(0f);
+        track.addView(pairCardProgressFill, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        LinearLayout.LayoutParams trackLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(3));
+        trackLp.topMargin = dp(8);
+        pairCard.addView(track, trackLp);
+
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                dp(430), ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.gravity = Gravity.TOP | Gravity.RIGHT;
+        lp.rightMargin = dp(20);
+        lp.topMargin = dp(114); // placeholder; showPairCard sets it from the header height
+        root.addView(pairCard, lp);
+        applyPairCardTheme();
+    }
+
+    /** Card colors follow the browser appearance (dark/light chrome). */
+    private void applyPairCardTheme() {
+        if (pairCard == null) return;
+        boolean dark = browserDark();
+        pairCardBg.setColor(dark ? Color.argb(235, 0x1C, 0x1C, 0x1E)
+                                 : Color.argb(235, 0xF2, 0xF2, 0xF7));
+        pairCardBg.setStroke(dp(1), dark ? Color.argb(36, 255, 255, 255) : tbBorder());
+        int text = tbText();
+        int dim = dark ? DIM : Color.parseColor("#8E8E93");
+        pairCardTitle.setTextColor(text);
+        pairCardAddr.setTextColor(text);
+        pairCardLabel.setTextColor(dim);
+        pairCardBody.setTextColor(dim);
+        pairCardCount.setTextColor(dim);
+        pairCardPinTag.setTextColor(dim);
+        pairCardTrackBg.setColor(dark ? Color.argb(38, 255, 255, 255)
+                                      : Color.argb(31, 0, 0, 0));
+        // PIN digits stay ACCENT and the QR tile stays white in
+        // both appearances (set once at build / in the drawable).
+    }
+
+    /** This build's versionCode, straight from the package. */
+    private int appVersionCode() {
+        try {
+            return getPackageManager().getPackageInfo(getPackageName(), 0).versionCode;
+        } catch (Exception ignored) {
+            return 0;
+        }
+    }
+
+    /**
+     * v1.32: the pairing address is VERSIONED - .../?v=<versionCode>.
+     * The unversioned address was identical for every build, so a
+     * phone tab restored from its snapshot/cache at the old address
+     * could keep running a pre-update copy of the remote page (its
+     * WebSocket reconnects, so the stale page looks alive) - that
+     * is how the v1.31 text removals "never happened" on Kurt's
+     * phone. A new versionCode makes the phone fetch the fresh
+     * document. RemoteServer strips the query string when routing
+     * (and the page's WebSocket uses location.host), so nothing
+     * server-side changes.
+     */
+    private String remotePageUrl() {
+        return "http://" + RemoteServer.localIpAddress(this)
+                + ":" + RemoteServer.PORT + "/?v=" + appVersionCode();
+    }
+
+    /** Fill the card for the CURRENT server state (on: address + PIN + QR; off: turn-on prompt). */
+    private void fillPairCard() {
+        if (pairCard == null) return;
+        applyPairCardTheme();
+        if (remoteOn()) {
+            pairCardTitle.setText("Pair your phone");
+            pairCardBody.setVisibility(View.GONE);
+            String url = remotePageUrl();
+            pairCardAddr.setText(url);
+            pairCardAddr.setVisibility(View.VISIBLE);
+            pairCardPinDigits.setText(spacedPin(remoteServer.pin()));
+            pairCardPinRow.setVisibility(View.VISIBLE);
+            Bitmap qr = null;
+            try { qr = renderQrBitmap(url, dp(92)); } catch (Exception ignored) {}
+            if (qr != null) {
+                pairCardQr.setImageBitmap(qr);
+                pairCardQrTile.setVisibility(View.VISIBLE);
+            } else {
+                pairCardQrTile.setVisibility(View.GONE);
+            }
+        } else {
+            pairCardTitle.setText("Phone remote is off");
+            pairCardBody.setText("Tap this card or press OK to turn it on");
+            pairCardBody.setVisibility(View.VISIBLE);
+            pairCardAddr.setVisibility(View.GONE);
+            pairCardPinRow.setVisibility(View.GONE);
+            pairCardQrTile.setVisibility(View.GONE);
+        }
+    }
+
+    private void showPairCard() {
+        if (pairCard == null) return;
+        pairCardGen++;
+        fillPairCard();
+        // Anchor: top-right, 10dp below the header block (the
+        // v1.29 floating bar + progress), 20dp off the right edge.
+        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) pairCard.getLayoutParams();
+        int hb = headerBlock != null ? headerBlock.getHeight() : 0;
+        if (hb <= 0) hb = dp(90);
+        lp.topMargin = hb + dp(10);
+        pairCard.setLayoutParams(lp);
+        pairCardVisible = true;
+        pairCard.setVisibility(View.VISIBLE);
+        pairCard.animate().cancel();
+        pairCard.setTranslationX(dp(40));
+        pairCard.setAlpha(0f);
+        pairCard.animate().translationX(0f).alpha(1f).setDuration(240)
+                .setInterpolator(new DecelerateInterpolator()).start();
+        startPairCardCountdown();
+        refreshCursor("paircard-show"); // v1.32
+    }
+
+    private void hidePairCard() { hidePairCard(true); }
+
+    private void hidePairCardNow() { hidePairCard(false); }
+
+    private void hidePairCard(boolean animate) {
+        stopPairCardCountdown();
+        if (pairCard == null || !pairCardVisible) return;
+        refreshCursor("paircard-hide"); // v1.32: only on an actual hide, not every no-op call
+        pairCardVisible = false;
+        pairCardGen++;
+        pairCard.animate().cancel();
+        if (animate) {
+            pairCard.animate().translationX(dp(40)).alpha(0f).setDuration(180)
+                    .setInterpolator(new DecelerateInterpolator())
+                    .withEndAction(() -> {
+                        if (!pairCardVisible && pairCard != null) {
+                            pairCard.setVisibility(View.GONE);
+                            pairCard.setAlpha(1f);
+                            pairCard.setTranslationX(0f);
+                        }
+                    }).start();
+        } else {
+            pairCard.setVisibility(View.GONE);
+            pairCard.setAlpha(1f);
+            pairCard.setTranslationX(0f);
+        }
+    }
+
+    private void startPairCardCountdown() {
+        stopPairCardCountdown();
+        pairCardSecondsLeft = (int) (PAIR_CARD_MS / 1000);
+        updatePairCardCountdownText();
+        if (pairCardProgressFill != null) {
+            pairCardProgressFill.setScaleX(1f);
+            pairCardDrain = ValueAnimator.ofFloat(1f, 0f);
+            pairCardDrain.setDuration(PAIR_CARD_MS);
+            pairCardDrain.setInterpolator(new LinearInterpolator());
+            pairCardDrain.addUpdateListener(a -> {
+                if (pairCardProgressFill != null)
+                    pairCardProgressFill.setScaleX((Float) a.getAnimatedValue());
+            });
+            pairCardDrain.start();
+        }
+        ui.postDelayed(pairCardTickRunnable, 1000);
+    }
+
+    private void stopPairCardCountdown() {
+        ui.removeCallbacks(pairCardTickRunnable);
+        if (pairCardDrain != null) { pairCardDrain.cancel(); pairCardDrain = null; }
+    }
+
+    private void updatePairCardCountdownText() {
+        if (pairCardCount != null)
+            pairCardCount.setText("Closes in " + pairCardSecondsLeft + "s");
+    }
+
+    /**
+     * The card's one action, shared by the mouse/phone tap claim
+     * (dispatchTap), the D-pad CENTER interception
+     * (dispatchKeyEvent) and nothing else: server OFF -> turn the
+     * remote on (the panel's exact turn-on sequence), rebuild to
+     * the ON content and restart the full countdown; server ON ->
+     * the card hands over to the full manual pairing panel.
+     */
+    private void pairCardAction() {
+        if (!pairCardVisible) return;
+        if (!remoteOn()) {
+            prefs.edit().putBoolean(KEY_REMOTE, true).apply();
+            stopRemoteServer(); // clear any dead instance
+            startRemoteServer();
+            refreshSettingsLabels();
+            fillPairCard();
+            startPairCardCountdown();
+        } else {
+            hidePairCard();
+            openRemotePanel();
+        }
+    }
+
+    /** Hit test in window coords (the tap path's coordinate space). */
+    private boolean pairCardContains(float x, float y) {
+        if (pairCard == null || pairCard.getWidth() <= 0) return false;
+        int[] loc = new int[2];
+        pairCard.getLocationInWindow(loc);
+        return x >= loc[0] && x < loc[0] + pairCard.getWidth()
+                && y >= loc[1] && y < loc[1] + pairCard.getHeight();
+    }
+
+    private int pairedCount() {
+        return remoteServer != null ? remoteServer.sessionCount() : 0;
+    }
+
+    /**
+     * v1.20: Phone toolbar button label tints accent while paired.
+     * v1.22: the Home header Phone button follows the same rule
+     * (its resting color is Home's TEXT, not the browser toolbar's).
+     */
+    private void refreshPhoneBtn() {
+        boolean paired = pairedCount() > 0;
+        // v1.25: the browser-toolbar Phone button is icon-only now;
+        // the paired accent drives the icon's color filter. The
+        // Home Phone button stays text (v1.22) and keeps its rule.
+        if (tbPhone != null && phoneIconDrawable != null)
+            phoneIconDrawable.setColorFilter(paired ? ACCENT : tbText(), PorterDuff.Mode.SRC_IN);
+        if (homePhoneBtn != null) homePhoneBtn.setTextColor(paired ? ACCENT : TEXT);
+    }
+
+    // -------------------------------------------- v1.25: toolbar tooltips
+
+    /** Name bubble text for a toolbar element (Mode = current sub-mode). */
+    private String toolbarTipText(View v) {
+        if (v == tbBack) return "Back";
+        if (v == tbFwd) return "Forward";
+        if (v == addrCapsule) return "URL";
+        if (v == tbReload) return "Reload";
+        if (v == tbMode) return browserMouse ? "Mouse" : "D-pad";
+        if (v == tbPhone) return "Phone";
+        if (v == tbGear) return "Settings";
+        if (v == tbDone) return "Done";
+        return null;
+    }
+
+    /** Tooltips live only over the visible browser toolbar, one at a time. */
+    private boolean toolbarTipSuppressed() {
+        // v1.28: the pairing prompt is an in-window CARD now, not a
+        // tracked dialog, so the browserDialogDepth clause no
+        // longer covers it - pairCardVisible takes that clause's
+        // place: no tooltip competes with the card while it is up.
+        return toolbarTipView == null || currentScreen != browserPane
+                || fsView != null || browserDialogDepth > 0 || headerHidden
+                || pairCardVisible;
+    }
+
+    private void scheduleToolbarTip(View v, long delayMs) {
+        if (v == null || toolbarTipText(v) == null || toolbarTipSuppressed()) return;
+        if (toolbarTipTarget == v && toolbarTipView.getVisibility() == View.VISIBLE)
+            return; // already naming this element
+        if (toolbarTipView.getVisibility() == View.VISIBLE) {
+            // A different element's bubble is up: drop it now, the
+            // new one still waits out its (short) dwell.
+            toolbarTipView.setVisibility(View.GONE);
+            toolbarTipTarget = null;
+        }
+        pendingTipTarget = v;
+        ui.removeCallbacks(toolbarTipShowRunnable);
+        ui.postDelayed(toolbarTipShowRunnable, delayMs);
+    }
+
+    private void showToolbarTip(View v) {
+        if (toolbarTipSuppressed()) return;
+        String text = toolbarTipText(v);
+        if (text == null) return;
+        toolbarTipTarget = v;
+        toolbarTipView.setText(text);
+        positionToolbarTip(v);
+        toolbarTipView.setVisibility(View.VISIBLE);
+    }
+
+    private void hideToolbarTip() {
+        ui.removeCallbacks(toolbarTipShowRunnable);
+        pendingTipTarget = null;
+        toolbarTipTarget = null;
+        if (toolbarTipView != null) toolbarTipView.setVisibility(View.GONE);
+    }
+
+    /**
+     * Center the bubble on the element (pane coordinates, clamped
+     * inside the pane). Vertically it goes ABOVE the element when
+     * there is room; the toolbar sits at the very top of the
+     * screen, so in practice there is not, and it lands just below
+     * the element instead - still inside the pane, never covering
+     * the button it names.
+     */
+    private void positionToolbarTip(View v) {
+        if (browserPane == null || v.getWidth() <= 0) return;
+        FrameLayout.LayoutParams lp =
+                (FrameLayout.LayoutParams) toolbarTipView.getLayoutParams();
+        try {
+            int[] paneLoc = new int[2]; browserPane.getLocationInWindow(paneLoc);
+            int[] elLoc = new int[2]; v.getLocationInWindow(elLoc);
+            int elLeft = elLoc[0] - paneLoc[0], elTop = elLoc[1] - paneLoc[1];
+            int elCx = elLeft + v.getWidth() / 2;
+            int wSpec = View.MeasureSpec.makeMeasureSpec(
+                    Math.max(0, browserPane.getWidth()), View.MeasureSpec.AT_MOST);
+            int hSpec = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED);
+            toolbarTipView.measure(wSpec, hSpec);
+            int tw = toolbarTipView.getMeasuredWidth();
+            int th = toolbarTipView.getMeasuredHeight();
+            int left = Math.max(dp(4), Math.min(
+                    Math.max(dp(4), browserPane.getWidth() - tw - dp(4)), elCx - tw / 2));
+            int above = elTop - th - dp(6);
+            int top = above >= dp(2) ? above : elTop + v.getHeight() + dp(6);
+            lp.leftMargin = left; lp.topMargin = top;
+            toolbarTipView.setLayoutParams(lp);
+        } catch (Exception ignored) {}
+    }
+
+    /**
+     * Mouse-hover tracking, called at the end of every moveCursor():
+     * hit-test the cursor (window coordinates, the same space
+     * getLocationInWindow reports) against the toolbar elements.
+     * A new element starts a 350ms dwell; leaving all elements,
+     * or any suppressed state, hides the bubble at once.
+     */
+    private void updateToolbarHover() {
+        if (!browserMouse || toolbarTipSuppressed()) { hideToolbarTip(); return; }
+        int[] rootLoc = new int[2];
+        if (windowRoot != null) windowRoot.getLocationInWindow(rootLoc);
+        float wx = cursorX + rootLoc[0], wy = cursorY + rootLoc[1];
+        View hit = null;
+        // v1.29: iterate in REVERSE - Reload now lives INSIDE the
+        // address capsule's bounds, so the specific child must win
+        // the hit test over the capsule that contains it.
+        for (int i = toolbarViews.size() - 1; i >= 0; i--) {
+            View v = toolbarViews.get(i);
+            if (v == null || v.getWidth() <= 0 || v.getVisibility() != View.VISIBLE) continue;
+            int[] loc = new int[2]; v.getLocationInWindow(loc);
+            if (wx >= loc[0] && wx < loc[0] + v.getWidth()
+                    && wy >= loc[1] && wy < loc[1] + v.getHeight()) { hit = v; break; }
+        }
+        if (hit == null) { hideToolbarTip(); return; }
+        if (hit == toolbarTipTarget && toolbarTipView.getVisibility() == View.VISIBLE) return;
+        if (hit == pendingTipTarget) return; // dwell already running for it
+        scheduleToolbarTip(hit, 350);
+    }
 
     private final Runnable remoteHeartbeat = new Runnable() {
         @Override public void run() {
@@ -2942,9 +4327,11 @@ public class MainActivity extends Activity {
         if (remoteServer == null) return;
         remoteServer.stop();
         remoteServer = null;
+        refreshPhoneBtn(); // v1.20: no server = no pairing = normal tint
     }
 
     private void pushRemoteState() {
+        refreshPhoneBtn(); // v1.20: heartbeat (2.5s) funnels through here - tint stays fresh
         if (remoteServer == null) return;
         try { remoteServer.broadcast(buildRemoteStateJson()); }
         catch (Exception ignored) {}
@@ -2959,6 +4346,12 @@ public class MainActivity extends Activity {
             o.put("fs", fsLikeActive());
             o.put("mouse", browserMouse);
             o.put("browser", currentScreen == browserPane);
+            // v1.22: which screen the TV is on (the phone page keys
+            // its mode caption off this; "browser" stays for compat).
+            o.put("screen", currentScreen == homeScroll ? "home"
+                    : currentScreen == searchPane ? "search"
+                    : currentScreen == settingsScroll ? "settings"
+                    : currentScreen == browserPane ? "browser" : "other");
             o.put("canBack", webView != null && webView.canGoBack());
             o.put("canFwd", webView != null && webView.canGoForward());
             o.put("paired", remoteServer != null ? remoteServer.sessionCount() : 0);
@@ -3040,7 +4433,15 @@ public class MainActivity extends Activity {
             if (fsLikeActive()) pokeFsCursor(); // a tap is interaction: un-fade + re-arm
         }
         @Override public void remoteLongTap() {
-            if (currentScreen != browserPane) return;
+            if (currentScreen != browserPane) {
+                // v1.25: the phone's trackpad used on a TV menu
+                // (trackpad mode manually picked while off-browser)
+                // long-presses like the Apple TV Remote's touch
+                // surface: a long DPAD_CENTER through the input
+                // queue, so Home tiles open their long-press menus.
+                injectKeyHold(KeyEvent.KEYCODE_DPAD_CENTER, 600);
+                return;
+            }
             if (fsView != null) dispatchFsTap(cursorX, cursorY);
             else dispatchLongTap(cursorX, cursorY);
             if (fsLikeActive()) pokeFsCursor();
@@ -3066,16 +4467,39 @@ public class MainActivity extends Activity {
         }
         @Override public void remotePlayPause() {
             if (currentScreen != browserPane) return;
-            if (fsView != null) dispatchFsTap(fsCenterX(), fsCenterY());
-            else togglePlayJs();
+            // v1.31: one shared layered implementation with the
+            // physical media keys. In real fullscreen it still ends
+            // in the FS center tap: the shared path fires the
+            // media-key fallback, and the injected key lands back
+            // in handleFullscreenKey (the pass-through in
+            // dispatchKeyEvent is non-FS only).
+            togglePlayPause("phone");
         }
         @Override public void remoteUrl(String u) {
-            if (currentScreen != browserPane || webView == null) return;
-            loadResolved(u == null ? "" : u.trim()); // same normalization as the URL dialog
+            if (webView == null) return;
+            String t = u == null ? "" : u.trim();
+            if (t.isEmpty()) return;
+            if (currentScreen == browserPane) { loadResolved(t); return; }
+            // v1.28 (Part 4): the URL panel is visible in D-pad
+            // mode too now, so a URL sent from a menu screen does
+            // what the user expects - it opens the browser on the
+            // resolved address, like tapping a generic entry.
+            String resolved = resolveUrlString(t);
+            if (resolved == null) return;
+            String host = hostOf(resolved);
+            openEntry(new Entry("misc", "Browser", host, resolved, host, false, ""));
         }
         @Override public void remoteType(final String text) {
-            if (currentScreen != browserPane || webView == null
-                    || text == null || text.isEmpty()) return;
+            if (text == null || text.isEmpty()) return;
+            if (currentScreen != browserPane || webView == null) {
+                // v1.28 (Part 4): with the Type panel visible in
+                // D-pad mode too, an off-browser send gets the same
+                // honest note an in-browser miss gets (below),
+                // instead of silence.
+                remoteNote = "No text field focused on TV";
+                pushRemoteState();
+                return;
+            }
             try {
                 webView.evaluateJavascript(
                         String.format(REMOTE_TYPE_JS, JSONObject.quote(text)),
@@ -3093,6 +4517,23 @@ public class MainActivity extends Activity {
             try { webView.evaluateJavascript(REMOTE_ENTER_JS, null); }
             catch (Exception ignored) {}
         }
+        @Override public void remoteKey(String k) {
+            // v1.22 D-pad mode: deliberately NOT browser-gated -
+            // these keys drive whichever screen/dialog is current.
+            if (k == null) return;
+            int code;
+            switch (k) {
+                case "up": code = KeyEvent.KEYCODE_DPAD_UP; break;
+                case "down": code = KeyEvent.KEYCODE_DPAD_DOWN; break;
+                case "left": code = KeyEvent.KEYCODE_DPAD_LEFT; break;
+                case "right": code = KeyEvent.KEYCODE_DPAD_RIGHT; break;
+                case "ok": code = KeyEvent.KEYCODE_DPAD_CENTER; break;
+                case "back": code = KeyEvent.KEYCODE_BACK; break;
+                case "menu": code = KeyEvent.KEYCODE_MENU; break;
+                default: return;
+            }
+            injectKey(code);
+        }
         @Override public void remoteVolume(int dir) {
             try {
                 AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
@@ -3103,21 +4544,161 @@ public class MainActivity extends Activity {
         }
         @Override public void remoteSeek(int seconds) {
             if (currentScreen != browserPane || webView == null) return;
+            // v1.26: the seek flash fires immediately with the command.
+            showActionFeedback(fbBitmap(seconds >= 0 ? "fwd" : "back"));
             try {
                 webView.evaluateJavascript(
                         String.format(Locale.US, REMOTE_SEEK_JS, seconds), null);
             } catch (Exception ignored) {}
         }
         @Override public void remoteSessionsChanged() {
+            int count = pairedCount();
+            boolean firstPhone = lastRemotePairedCount == 0 && count > 0;
+            lastRemotePairedCount = count;
             if (remotePairCountView != null && remoteServer != null)
                 remotePairCountView.setText(
                         "Phones paired: " + remoteServer.sessionCount() + " / 2");
+            refreshPhoneBtn(); // v1.20
+            refreshCursor("remote-sessions"); // v1.32: phone connect/disconnect re-asserts the cursor (Kurt's repro is phone-connected)
+            // v1.21: the first phone connecting is the exact
+            // reported black-video moment - kick the layer.
+            if (firstPhone) kickVideoLayer("pair");
+            // v1.28: a phone pairing while the auto CARD is up
+            // ends it: stop the countdown, swap the card to its
+            // connected state, and slide it out after ~800ms.
+            if (count > 0 && pairCardVisible) {
+                stopPairCardCountdown();
+                if (pairCardTitle != null) pairCardTitle.setText("Phone connected ✓");
+                if (pairCardCount != null) pairCardCount.setText("Paired!");
+                final int gen = pairCardGen;
+                ui.postDelayed(() -> {
+                    if (gen == pairCardGen && pairCardVisible) hidePairCard();
+                }, 800);
+            }
             pushRemoteState();
         }
     };
 
-    /** Pairing panel (TV side): address, QR, PIN, session controls. */
+    /**
+     * v1.23: phone-remote keys go through the system input queue
+     * first (Instrumentation.sendKeySync on the injection thread -
+     * see the input-injection section below). The queue targets
+     * whichever window is foreground, so keys reach WebView native
+     * popups (e.g. a <select> list, which lives in its own window)
+     * as well as dialogs and the activity, and this app's own
+     * dispatchKeyEvent interception still runs for them exactly as
+     * for hardware keys, because that IS how hardware keys arrive.
+     * If injection throws, fall back per-event to the v1.22 direct
+     * dispatch below.
+     */
+    private void injectKey(final int code) {
+        injectExecutor().execute(() -> {
+            try {
+                if (injectIns == null) injectIns = new Instrumentation();
+                long now = SystemClock.uptimeMillis();
+                injectIns.sendKeySync(new KeyEvent(now, now,
+                        KeyEvent.ACTION_DOWN, code, 0));
+                long upNow = SystemClock.uptimeMillis();
+                injectIns.sendKeySync(new KeyEvent(now, upNow,
+                        KeyEvent.ACTION_UP, code, 0));
+                logInjectOk();
+            } catch (Exception e) {
+                Log.d("HeckYeahFS", "inject fallback key " + code + ": "
+                        + e.getClass().getSimpleName());
+                ui.post(() -> injectKeyViaDispatch(code));
+            }
+        });
+    }
+
+    /**
+     * v1.25: injectKey's hold variant - the key stays DOWN for
+     * holdMs before the UP, a genuine long press through the
+     * system input queue (used for menu long-presses from the
+     * phone trackpad). Same thread and fallback discipline as
+     * injectKey; the quick DOWN+UP path is untouched.
+     */
+    private void injectKeyHold(final int code, final long holdMs) {
+        injectExecutor().execute(() -> {
+            try {
+                if (injectIns == null) injectIns = new Instrumentation();
+                long now = SystemClock.uptimeMillis();
+                injectIns.sendKeySync(new KeyEvent(now, now,
+                        KeyEvent.ACTION_DOWN, code, 0));
+                try { Thread.sleep(holdMs); }
+                catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                long upNow = SystemClock.uptimeMillis();
+                injectIns.sendKeySync(new KeyEvent(now, upNow,
+                        KeyEvent.ACTION_UP, code, 0));
+                logInjectOk();
+            } catch (Exception e) {
+                Log.d("HeckYeahFS", "inject fallback keyhold " + code + ": "
+                        + e.getClass().getSimpleName());
+                ui.post(() -> injectKeyHoldViaDispatch(code, holdMs));
+            }
+        });
+    }
+
+    /** injectKeyHold fallback: direct dispatch, UP posted after the hold. */
+    private void injectKeyHoldViaDispatch(final int code, final long holdMs) {
+        final long now = SystemClock.uptimeMillis();
+        try {
+            AlertDialog d = openDialog;
+            KeyEvent down = new KeyEvent(now, now, KeyEvent.ACTION_DOWN, code, 0);
+            if (d != null && d.isShowing()) d.dispatchKeyEvent(down);
+            else dispatchKeyEvent(down);
+        } catch (Exception ignored) {}
+        ui.postDelayed(() -> {
+            try {
+                AlertDialog d = openDialog;
+                KeyEvent up = new KeyEvent(now, SystemClock.uptimeMillis(),
+                        KeyEvent.ACTION_UP, code, 0);
+                if (d != null && d.isShowing()) d.dispatchKeyEvent(up);
+                else dispatchKeyEvent(up);
+            } catch (Exception ignored) {}
+        }, holdMs);
+    }
+
+    /**
+     * v1.22 fallback (kept): deliver a synthesized key by direct
+     * dispatch. If a tracked dialog is showing, the
+     * key goes to the DIALOG's own dispatchKeyEvent - physical keys
+     * target the foreground window, so D-pad moves dialog focus and
+     * BACK cancels the dialog, never the screen behind it. Otherwise
+     * the key goes through THIS activity's dispatchKeyEvent: the
+     * app's interception layer (MENU handling, fullscreen-first,
+     * browser key swallowing) runs exactly as for hardware keys,
+     * and unhandled keys fall through super.dispatchKeyEvent to the
+     * focused view / focus pipeline. BACK needs no special case:
+     * it is not a browser key (see isBrowserKey), so the pair falls
+     * to the stock Activity callback - onKeyDown starts BACK
+     * tracking, onKeyUp fires this app's onBackPressed override
+     * (browser page-back / close, screen back, fullscreen exit).
+     */
+    private void injectKeyViaDispatch(int code) {
+        long now = SystemClock.uptimeMillis();
+        KeyEvent down = new KeyEvent(now, now, KeyEvent.ACTION_DOWN, code, 0);
+        KeyEvent up = new KeyEvent(now, now, KeyEvent.ACTION_UP, code, 0);
+        try {
+            AlertDialog d = openDialog;
+            if (d != null && d.isShowing()) {
+                d.dispatchKeyEvent(down);
+                d.dispatchKeyEvent(up);
+            } else {
+                dispatchKeyEvent(down);
+                dispatchKeyEvent(up);
+            }
+        } catch (Exception ignored) {}
+    }
+
+    /**
+     * Pairing panel (TV side): address, QR, PIN, session controls.
+     * Manual opens only (Phone buttons, menu, settings). v1.28: the
+     * v1.27 auto variant of this dialog is GONE - the browser-start
+     * auto prompt is the themed in-window CARD now (see the
+     * pairCard block); opening this panel supersedes the card.
+     */
     private void openRemotePanel() {
+        hidePairCardNow(); // v1.28: the manual panel supersedes the auto card
         boolean on = remoteServer != null && remoteServer.isRunning();
         LinearLayout box = new LinearLayout(dialogContext());
         box.setOrientation(LinearLayout.VERTICAL);
@@ -3134,7 +4715,7 @@ public class MainActivity extends Activity {
                         stopRemoteServer(); // clear any dead instance
                         startRemoteServer();
                         refreshSettingsLabels();
-                        ui.post(this::openRemotePanel);
+                        ui.post(() -> openRemotePanel());
                     })
                     .setNegativeButton("Close", null)
                     .create();
@@ -3142,10 +4723,10 @@ public class MainActivity extends Activity {
             d.show();
             return;
         }
-        String ip = RemoteServer.localIpAddress(this);
-        final String url = "http://" + ip + ":" + RemoteServer.PORT;
+        final String url = remotePageUrl(); // v1.32: versioned, see remotePageUrl()
         box.addView(tv(url, 17, TEXT, true));
         TextView alt = tv("or http://HeckYeah-TV.local:" + RemoteServer.PORT
+                + "/?v=" + appVersionCode()
                 + " (extra B: name resolution is reliable on iPhone; "
                 + "Android phones may need the IP address above)", 12, DIM, false);
         alt.setPadding(0, dp(4), 0, 0);
@@ -3175,16 +4756,18 @@ public class MainActivity extends Activity {
                 .setPositiveButton("Close", null)
                 .setNegativeButton("New PIN", (dlg, w) -> {
                     if (remoteServer != null) remoteServer.regeneratePinAndDropSessions();
-                    ui.post(this::openRemotePanel);
+                    ui.post(() -> openRemotePanel());
                 })
                 .setNeutralButton("Disconnect all", (dlg, w) -> {
                     if (remoteServer != null) remoteServer.dropAllSessions();
-                    ui.post(this::openRemotePanel);
+                    ui.post(() -> openRemotePanel());
                 })
                 .create();
-        d.setOnShowListener(x -> browserDialogDepth++);
-        d.setOnDismissListener(x -> {
-            if (browserDialogDepth > 0) browserDialogDepth--;
+        // v1.21: use the shared dialog funnel (it previously
+        // open-coded the same counting) so this panel's dismiss
+        // also runs the depth-0 video kick; the extra runnable
+        // keeps its label cleanup.
+        trackDialog(d, () -> {
             remotePairCountView = null;
         });
         d.show();
@@ -3367,6 +4950,8 @@ public class MainActivity extends Activity {
      */
     private void showFullscreen(View view, WebChromeClient.CustomViewCallback callback) {
         fsView = view; fsCallback = callback;
+        cancelAutoPairPopup(); // v1.28: no pending auto card, and a visible one hides, into fullscreen
+        hideToolbarTip(); // v1.25: no toolbar tooltip in fullscreen either
         // v1.15: freeze the page scroll for the whole FS session -
         // snapshot BEFORE anything attaches or lays out, and clear
         // the inline video detection (the video bound no longer
@@ -3457,7 +5042,7 @@ public class MainActivity extends Activity {
         // Mouse cursor above the video (it lives at decor level, last
         // child; bringToFront re-asserts that over fsContainer).
         if (cursorView != null) cursorView.bringToFront();
-        updateCursorVisibility();
+        refreshCursor("fs-show"); // v1.32 (was updateCursorVisibility)
         pokeFsCursor(); // start the 10s idle fade (mouse sub-mode only)
         pushRemoteState(); // v1.19
     }
@@ -3800,14 +5385,32 @@ public class MainActivity extends Activity {
         setRequestedOrientation(fsPrevOrientation); // v1.8: undo the fullscreen landscape lock
         WebChromeClient.CustomViewCallback cb = fsCallback;
         fsView = null; fsCallback = null;
-        updateCursorVisibility();
+        refreshCursor("fs-hide"); // v1.32 (was updateCursorVisibility)
         if (cb != null) try { cb.onCustomViewHidden(); } catch (Exception ignored) {}
         pushRemoteState(); // v1.19
     }
 
+    /**
+     * v1.27: the pill shows ONLY the main URL - the page's host
+     * ("atlantic.st"), not the full URL. The editor still opens
+     * with the full URL (openUrlDialog reads webView.getUrl()
+     * itself). Host-less URLs (about:, data:, file:) fall back to
+     * the string itself; the pill's ellipsize trims it to fit.
+     * Also the one funnel every navigation update passes through,
+     * so Back/Forward icon dimming refreshes here too.
+     */
     private void setUrlPillText(String url) {
-        if (url == null || url.isEmpty()) return;
-        urlPill.setText(url);
+        if (urlPill == null || url == null || url.isEmpty()) return;
+        urlPill.setText(displayHost(url));
+        refreshNavIcons();
+    }
+
+    private String displayHost(String url) {
+        try {
+            String h = Uri.parse(url).getHost();
+            if (h != null && !h.isEmpty()) return h;
+        } catch (Exception ignored) {}
+        return url;
     }
 
     private boolean handleUrl(String url) {
@@ -3825,8 +5428,9 @@ public class MainActivity extends Activity {
         return true;
     }
 
-    private void loadResolved(String input) {
-        if (input == null || input.isEmpty()) return;
+    /** The URL normalization shared by the dialog and the phone remote. */
+    private String resolveUrlString(String input) {
+        if (input == null || input.isEmpty()) return null;
         String u = input;
         try {
             if (!u.contains("://")) {
@@ -3835,7 +5439,12 @@ public class MainActivity extends Activity {
                 else u = "https://" + u;
             }
         } catch (Exception ignored) {}
-        webView.loadUrl(u);
+        return u;
+    }
+
+    private void loadResolved(String input) {
+        String u = resolveUrlString(input);
+        if (u != null) webView.loadUrl(u);
     }
 
     private void noteOrigin() {
@@ -3941,6 +5550,10 @@ public class MainActivity extends Activity {
      * the WebView or blanking the page, so Back-to can resume it.
      */
     private void closeBrowser() {
+        cancelAutoPairPopup(); // v1.27: dismiss the auto popup + cancel its countdown
+        hideToolbarTip(); // v1.25
+        cancelActionFeedback(); // v1.26: no feedback flash outlives the browser
+        autoPairShownThisSession = false; // v1.27: next browser launch may auto-pop again
         clearVideoData(); // v1.15: poll loop self-stops once another screen shows
         cancelFsFade(); // v1.17: a pseudo-FS exit via Done never reaches hideFullscreen (fsView is null) - never carry a faded cursor or a live fade timer out of the browser
         showHeader(false); // v1.4: restore the bar even if auto-hidden
@@ -4341,7 +5954,7 @@ public class MainActivity extends Activity {
     private void setBrowserMouse(boolean on, boolean announce) {
         browserMouse = on;
         prefs.edit().putBoolean(KEY_MOUSE, on).apply();
-        if (tbMode != null) tbMode.setText(on ? "Mouse" : "D-pad");
+        if (tbMode != null) updateModeBtn(); // v1.25: icon, not text
         if (on) {
             cursorX = getResources().getDisplayMetrics().widthPixels / 2f;
             cursorY = getResources().getDisplayMetrics().heightPixels / 2f;
@@ -4351,7 +5964,7 @@ public class MainActivity extends Activity {
             toolbarFocus = false; styleToolbarFocus();
             if (announce) Toast.makeText(this, "Browser D-pad: arrows scroll, \u25B2 at page top opens the toolbar, OK taps the page / activates a button", Toast.LENGTH_LONG).show();
         }
-        updateCursorVisibility();
+        refreshCursor("mode"); // v1.32: self-healing assert on BOTH toggle directions (Kurt's dead-cursor path)
         refreshSettingsLabels();
     }
 
@@ -4385,6 +5998,48 @@ public class MainActivity extends Activity {
                 else setBrowserMouse(!browserMouse, true);
             }
             return true; // MENU never falls through
+        }
+
+        // v1.28: while the auto pairing CARD is visible (browser,
+        // not fullscreen, no dialog), it owns two keys at the
+        // activity level - the card itself is non-focusable, so
+        // this interception is the only way it can be driven with
+        // the remote. BACK dismisses the card and is consumed (it
+        // must not ALSO go back in the page via onBackPressed,
+        // which is where an unconsumed BACK lands, BACK not being
+        // a browser key). In D-PAD sub-mode, CENTER/OK performs
+        // the card action (fired on UP, like the other CENTER
+        // handlers); in mouse sub-mode the CENTER key goes through
+        // dispatchTap's coordinate claim instead.
+        if (pairCardVisible && currentScreen == browserPane && fsView == null
+                && browserDialogDepth == 0) {
+            if (code == KeyEvent.KEYCODE_BACK) {
+                if (e.getAction() == KeyEvent.ACTION_DOWN && e.getRepeatCount() == 0)
+                    hidePairCard();
+                return true;
+            }
+            if (!browserMouse && (code == KeyEvent.KEYCODE_DPAD_CENTER
+                    || code == KeyEvent.KEYCODE_ENTER
+                    || code == KeyEvent.KEYCODE_NUMPAD_ENTER)) {
+                if (e.getAction() == KeyEvent.ACTION_UP) pairCardAction();
+                return true;
+            }
+        }
+
+        // v1.25 (Part D): our own injected play/pause fallback key
+        // must NOT be re-swallowed by the browser branch below -
+        // handleBrowserKey would call togglePlayPause again, whose JS
+        // would say "none" again, forever. mediaKeyPlayPause arms
+        // the flag; the key's DOWN clears it and the pair falls
+        // through to the WebView/Chromium media handling. Real
+        // fullscreen is exempt (fsView != null): there the injected
+        // key keeps the FS center-tap behavior in
+        // handleFullscreenKey.
+        if (code == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE && mediaKeyPassThrough
+                && fsView == null && currentScreen == browserPane
+                && browserDialogDepth == 0) {
+            if (e.getAction() == KeyEvent.ACTION_DOWN) mediaKeyPassThrough = false;
+            return super.dispatchKeyEvent(e);
         }
 
         // FULLSCREEN FIRST (v1.2): player controls must work over the
@@ -4456,7 +6111,9 @@ public class MainActivity extends Activity {
                     case KeyEvent.KEYCODE_DPAD_RIGHT: moveCursor(step, 0); break;
                     case KeyEvent.KEYCODE_PAGE_UP: case KeyEvent.KEYCODE_MEDIA_REWIND: doScrollBy(0, -pageScrollStep()); break;
                     case KeyEvent.KEYCODE_PAGE_DOWN: case KeyEvent.KEYCODE_MEDIA_FAST_FORWARD: doScrollBy(0, pageScrollStep()); break;
-                    case KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE: togglePlayJs(); break;
+                    case KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE:
+                        if (e.getRepeatCount() == 0) togglePlayPause("key");
+                        break;
                     default: break;
                 }
             }
@@ -4464,6 +6121,13 @@ public class MainActivity extends Activity {
         }
 
         // ---- Browser D-pad sub-mode ----
+        // v1.31: play/pause is a page action, not a toolbar action:
+        // route it to the shared toggle even while toolbar focus is
+        // up (previously the toolbar branch swallowed the key).
+        if (code == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE) {
+            if (down && e.getRepeatCount() == 0) togglePlayPause("key");
+            return;
+        }
         if (toolbarFocus) {
             if (down && e.getRepeatCount() == 0) {
                 switch (code) {
@@ -4505,7 +6169,7 @@ public class MainActivity extends Activity {
                 case KeyEvent.KEYCODE_PAGE_UP: case KeyEvent.KEYCODE_MEDIA_REWIND: doScrollBy(0, -pageScrollStep()); break;
                 case KeyEvent.KEYCODE_PAGE_DOWN: case KeyEvent.KEYCODE_MEDIA_FAST_FORWARD: doScrollBy(0, pageScrollStep()); break;
                 case KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE:
-                    if (e.getRepeatCount() == 0) togglePlayJs();
+                    if (e.getRepeatCount() == 0) togglePlayPause("key");
                     break;
                 default: break;
             }
@@ -4599,32 +6263,507 @@ public class MainActivity extends Activity {
                 : getResources().getDisplayMetrics().heightPixels / 2f;
     }
 
-    /** Simulated tap delivered directly to the fullscreen container. */
-    private void dispatchFsTap(float x, float y) {
-        if (fsContainer == null) return;
+    // -------------------------------------------------- v1.23 input injection
+    //
+    // Browser taps used to be MotionEvents dispatched straight to
+    // a view in OUR window. That can never reach a WebView native
+    // popup: tapping an HTML <select> opens a framework list in
+    // its OWN window on top of the page, and view dispatch lands
+    // on the page underneath it. So taps (and phone-remote keys,
+    // see injectKey) now go through the system input queue via
+    // Instrumentation: the queue delivers to the TOP window at the
+    // coordinates, exactly like a real finger - the select popup
+    // when it is open, the page otherwise. The popup window is
+    // created by the WebView in our own process/UID, so injection
+    // is permitted; if Fire OS still refuses (any exception), the
+    // gesture falls back to the previous view-dispatch behavior
+    // and the failure is logged under HeckYeahFS.
+    //
+    // sendPointerSync/sendKeySync BLOCK until the event is
+    // delivered, so every injected gesture runs on one dedicated
+    // background thread, which also serializes all gestures in
+    // submission order. Nothing here ever runs on the UI thread
+    // beyond enqueueing.
+
+    private ExecutorService injectExec;   // single-thread, created lazily
+    private Instrumentation injectIns;    // only ever touched on that thread
+    private boolean injectOkLogged;       // one success line per session
+
+    private ExecutorService injectExecutor() {
+        if (injectExec == null) injectExec = Executors.newSingleThreadExecutor();
+        return injectExec;
+    }
+
+    private void logInjectOk() {
+        if (!injectOkLogged) {
+            injectOkLogged = true;
+            Log.d("HeckYeahFS", "inject mode=instrumentation");
+        }
+    }
+
+    /**
+     * Inject one pointer gesture in DISPLAY coordinates (sx, sy):
+     * DOWN, an optional hold, UP, as a touchscreen source. On any
+     * failure, fallbackAll runs on the UI thread if the DOWN never
+     * landed, or fallbackUp if it did (so a half-delivered gesture
+     * is completed, never duplicated).
+     */
+    private void injectPointer(final float sx, final float sy, final long holdMs,
+                               final String what, final Runnable fallbackAll,
+                               final Runnable fallbackUp) {
+        injectExecutor().execute(() -> {
+            boolean downSent = false;
+            try {
+                if (injectIns == null) injectIns = new Instrumentation();
+                long downTime = SystemClock.uptimeMillis();
+                MotionEvent d = MotionEvent.obtain(downTime, downTime,
+                        MotionEvent.ACTION_DOWN, sx, sy, 0);
+                d.setSource(InputDevice.SOURCE_TOUCHSCREEN);
+                try { injectIns.sendPointerSync(d); } finally { d.recycle(); }
+                downSent = true;
+                if (holdMs > 0) {
+                    try { Thread.sleep(holdMs); }
+                    catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                }
+                long upTime = SystemClock.uptimeMillis();
+                MotionEvent u = MotionEvent.obtain(downTime, upTime,
+                        MotionEvent.ACTION_UP, sx, sy, 0);
+                u.setSource(InputDevice.SOURCE_TOUCHSCREEN);
+                try { injectIns.sendPointerSync(u); } finally { u.recycle(); }
+                logInjectOk();
+            } catch (Exception e) {
+                Log.d("HeckYeahFS", "inject fallback " + what + ": "
+                        + e.getClass().getSimpleName());
+                ui.post(downSent ? fallbackUp : fallbackAll);
+            }
+        });
+    }
+
+    /** Pre-v1.23 behavior, kept as the injection fallback. */
+    private void viewDispatchTap(View target, float x, float y) {
+        if (target == null) return;
         long now = SystemClock.uptimeMillis();
-        MotionEvent d = MotionEvent.obtain(now, now, MotionEvent.ACTION_DOWN, x, y, 0);
-        MotionEvent u = MotionEvent.obtain(now, now + 50, MotionEvent.ACTION_UP, x, y, 0);
-        fsContainer.dispatchTouchEvent(d);
-        fsContainer.dispatchTouchEvent(u);
-        d.recycle(); u.recycle();
+        MotionEvent down = MotionEvent.obtain(now, now, MotionEvent.ACTION_DOWN, x, y, 0);
+        MotionEvent up = MotionEvent.obtain(now, now + 50, MotionEvent.ACTION_UP, x, y, 0);
+        target.dispatchTouchEvent(down);
+        target.dispatchTouchEvent(up);
+        down.recycle(); up.recycle();
+    }
+
+    /** Completes a gesture whose injected DOWN landed but whose UP failed. */
+    private void viewDispatchUp(View target, float x, float y) {
+        if (target == null) return;
+        long now = SystemClock.uptimeMillis();
+        MotionEvent up = MotionEvent.obtain(now, now, MotionEvent.ACTION_UP, x, y, 0);
+        target.dispatchTouchEvent(up);
+        up.recycle();
+    }
+
+    /** The pre-v1.23 dispatchLongTap body, kept as its fallback. */
+    private void viewDispatchLongTap(float x, float y) {
+        long now = SystemClock.uptimeMillis();
+        MotionEvent down = MotionEvent.obtain(now, now, MotionEvent.ACTION_DOWN, x, y, 0);
+        windowRoot.dispatchTouchEvent(down); down.recycle();
+        ui.postDelayed(() -> {
+            long upNow = SystemClock.uptimeMillis();
+            MotionEvent up = MotionEvent.obtain(upNow, upNow, MotionEvent.ACTION_UP, x, y, 0);
+            windowRoot.dispatchTouchEvent(up); up.recycle();
+        }, 650);
+    }
+
+    /**
+     * Tap on the fullscreen container at container-local (x, y).
+     * Instrumentation needs display coordinates: the container is
+     * fullscreen, but convert through its on-screen location
+     * rather than assuming it.
+     */
+    private void dispatchFsTap(float x, float y) {
+        hideToolbarTip(); // v1.25: a click dismisses any name bubble
+        if (fsContainer == null) return;
+        int[] loc = new int[2];
+        fsContainer.getLocationOnScreen(loc);
+        injectPointer(x + loc[0], y + loc[1], 40, "fstap",
+                () -> viewDispatchTap(fsContainer, x, y),
+                () -> viewDispatchUp(fsContainer, x, y));
     }
 
     private void activateToolbarItem() {
+        hideToolbarTip(); // v1.25: activation is a click - bubble goes away
         View v = toolbarViews.get(toolbarIndex);
-        if (v == urlPill) { openUrlDialog(); return; }
+        if (v == addrCapsule) { openUrlDialog(); return; }
         if (v instanceof Button) ((Button) v).performClick();
     }
 
-    private void togglePlayJs() {
+    // ------------------------------------------------ v1.31: play/pause
+
+    /**
+     * One-shot pass-through for OUR OWN injected fallback key:
+     * armed by mediaKeyPlayPause(), cleared by the first injected
+     * MEDIA_PLAY_PAUSE reaching dispatchKeyEvent (which then lets
+     * it fall through to the WebView instead of re-entering the
+     * toggle - that would loop: JS "none" -> inject -> toggle ->
+     * JS "none" ...). A 2s sweeper clears a flag whose key never
+     * arrived (injection failure), so it can't eat a later
+     * genuine press.
+     */
+    private boolean mediaKeyPassThrough = false;
+
+    /** v1.31: one timestamp guards the shared toggle against a
+     * phone press and a hardware press (or a duplicate delivery)
+     * landing inside the same ~300ms and toggling twice. */
+    private long lastPlayPauseAt = 0;
+
+    /**
+     * L1 toggle JS. Strict ES5 only (var/function/try-catch; no
+     * arrow functions, let/const, template literals, optional
+     * chaining or Promise-dependent flow): the v1.25 audit found
+     * no ES6 syntax in the old script either, but every script in
+     * this layered path is kept ES5 so the Stick's old Chromium
+     * cannot silently kill it. Recursive scan of the top document
+     * and same-origin iframes (same approach as VIDEO_POLL_JS).
+     * Among videos with a visible rect of meaningful size, pause
+     * the LARGEST playing one ("js-paused"); else play the
+     * largest paused one ("js-played"); no reachable/controllable
+     * video -> a structured "none:..." result that also reports
+     * how many video elements were reachable and how many iframes
+     * were cross-origin (unreachable).
+     */
+    private static final String TOGGLE_PLAY_JS =
+            "(function(){try{"
+            + "var IW=window.innerWidth,IH=window.innerHeight;"
+            + "var bestPlay=null,playArea=0,bestPause=null,pauseArea=0,seen=0,xFrames=0;"
+            + "function scan(doc,ox,oy){"
+            + "var vs;try{vs=doc.querySelectorAll('video');}catch(e){return;}"
+            + "for(var i=0;i<vs.length;i++){var v=vs[i];"
+            + "try{"
+            + "var r=v.getBoundingClientRect();"
+            + "if(r.width<160||r.height<90)continue;"
+            + "var L=r.left+ox,T=r.top+oy,R=r.right+ox,B=r.bottom+oy;"
+            + "var ix=Math.max(0,Math.min(R,IW)-Math.max(L,0));"
+            + "var iy=Math.max(0,Math.min(B,IH)-Math.max(T,0));"
+            + "if(ix*iy<=0)continue;"
+            + "seen++;"
+            + "var area=r.width*r.height;"
+            + "var playing=!v.paused&&!v.ended&&(v.readyState>=2||v.currentTime>0);"
+            + "if(playing){if(area>playArea){playArea=area;bestPlay=v;}}"
+            + "else if(v.paused&&!v.ended){if(area>pauseArea){pauseArea=area;bestPause=v;}}"
+            + "}catch(e){}}"
+            + "var fs;try{fs=doc.querySelectorAll('iframe');}catch(e){return;}"
+            + "for(var j=0;j<fs.length;j++){var f=fs[j],cd=null;"
+            + "try{cd=f.contentDocument;}catch(e){}"
+            + "if(!cd){xFrames++;continue;}"
+            + "var fr;try{fr=f.getBoundingClientRect();}catch(e){continue;}"
+            + "scan(cd,ox+fr.left,oy+fr.top);}"
+            + "}"
+            + "scan(document,0,0);"
+            + "if(bestPlay){try{bestPlay.pause();return 'js-paused';}catch(e){return 'none:pause-threw,seen='+seen+',xframes='+xFrames;}}"
+            + "if(bestPause){try{var pr=bestPause.play();if(pr&&pr.catch){try{pr.catch(function(){});}catch(e){}}return 'js-played';}catch(e){return 'none:play-threw,seen='+seen+',xframes='+xFrames;}}"
+            + "return 'none:seen='+seen+',xframes='+xFrames;"
+            + "}catch(e){return 'none:error';}})()";
+
+    /**
+     * L2 click JS (strict ES5): the same reachable scan as L1,
+     * but instead of calling play()/pause() it dispatches a click
+     * on the largest playing (else largest paused) video element.
+     * Some players ignore direct method calls from page JS and
+     * only honor their own click handler. Returns
+     * "click-paused"/"click-played" (the state the click was
+     * aimed at) or the same structured "none:..." as L1.
+     */
+    private static final String CLICK_PLAY_JS =
+            "(function(){try{"
+            + "var IW=window.innerWidth,IH=window.innerHeight;"
+            + "var bestPlay=null,playArea=0,bestPause=null,pauseArea=0,seen=0,xFrames=0;"
+            + "function scan(doc,ox,oy){"
+            + "var vs;try{vs=doc.querySelectorAll('video');}catch(e){return;}"
+            + "for(var i=0;i<vs.length;i++){var v=vs[i];"
+            + "try{"
+            + "var r=v.getBoundingClientRect();"
+            + "if(r.width<160||r.height<90)continue;"
+            + "var L=r.left+ox,T=r.top+oy,R=r.right+ox,B=r.bottom+oy;"
+            + "var ix=Math.max(0,Math.min(R,IW)-Math.max(L,0));"
+            + "var iy=Math.max(0,Math.min(B,IH)-Math.max(T,0));"
+            + "if(ix*iy<=0)continue;"
+            + "seen++;"
+            + "var area=r.width*r.height;"
+            + "var playing=!v.paused&&!v.ended&&(v.readyState>=2||v.currentTime>0);"
+            + "if(playing){if(area>playArea){playArea=area;bestPlay=v;}}"
+            + "else if(v.paused&&!v.ended){if(area>pauseArea){pauseArea=area;bestPause=v;}}"
+            + "}catch(e){}}"
+            + "var fs;try{fs=doc.querySelectorAll('iframe');}catch(e){return;}"
+            + "for(var j=0;j<fs.length;j++){var f=fs[j],cd=null;"
+            + "try{cd=f.contentDocument;}catch(e){}"
+            + "if(!cd){xFrames++;continue;}"
+            + "var fr;try{fr=f.getBoundingClientRect();}catch(e){continue;}"
+            + "scan(cd,ox+fr.left,oy+fr.top);}"
+            + "}"
+            + "scan(document,0,0);"
+            + "var target=bestPlay?bestPlay:bestPause;"
+            + "if(!target)return 'none:seen='+seen+',xframes='+xFrames;"
+            + "try{target.click();}catch(e){return 'none:click-threw,seen='+seen+',xframes='+xFrames;}"
+            + "return bestPlay?'click-paused':'click-played';"
+            + "}catch(e){return 'none:error';}})()";
+
+    /**
+     * Post-action state probe (strict ES5): the largest visible,
+     * non-ended video reachable from the top document / same-
+     * origin iframes, reported as "playing", "paused" or "none".
+     * Unlike VIDEO_POLL_JS (playing videos only), this can name
+     * the paused state, so the ~450ms sample after a toggle can
+     * log - and flash - the state that actually resulted.
+     * Cross-origin players stay "none" here by design.
+     */
+    private static final String PLAY_STATE_JS =
+            "(function(){try{"
+            + "var IW=window.innerWidth,IH=window.innerHeight;"
+            + "var best=null,bestArea=0,bestPlaying=false;"
+            + "function scan(doc,ox,oy){"
+            + "var vs;try{vs=doc.querySelectorAll('video');}catch(e){return;}"
+            + "for(var i=0;i<vs.length;i++){var v=vs[i];"
+            + "try{"
+            + "if(v.ended)continue;"
+            + "var r=v.getBoundingClientRect();"
+            + "if(r.width<160||r.height<90)continue;"
+            + "var L=r.left+ox,T=r.top+oy,R=r.right+ox,B=r.bottom+oy;"
+            + "var ix=Math.max(0,Math.min(R,IW)-Math.max(L,0));"
+            + "var iy=Math.max(0,Math.min(B,IH)-Math.max(T,0));"
+            + "if(ix*iy<=0)continue;"
+            + "var area=r.width*r.height;"
+            + "if(area>bestArea){bestArea=area;best=v;bestPlaying=!v.paused;}"
+            + "}catch(e){}}"
+            + "var fs;try{fs=doc.querySelectorAll('iframe');}catch(e){return;}"
+            + "for(var j=0;j<fs.length;j++){var f=fs[j],cd=null;"
+            + "try{cd=f.contentDocument;}catch(e){}"
+            + "if(!cd)continue;"
+            + "var fr;try{fr=f.getBoundingClientRect();}catch(e){continue;}"
+            + "scan(cd,ox+fr.left,oy+fr.top);}"
+            + "}"
+            + "scan(document,0,0);"
+            + "if(!best)return 'none';"
+            + "return bestPlaying?'playing':'paused';"
+            + "}catch(e){return 'none';}})()";
+
+    /**
+     * v1.31: THE play/pause implementation for every entry point
+     * - the physical remote's MEDIA_PLAY_PAUSE (browser mouse and
+     * D-pad sub-modes; callers filter key repeats) and the phone
+     * remote's playpause command. One layered path:
+     *
+     *   L1  ES5 JS toggle (play()/pause() on the largest video).
+     *   L2  JS click on that video (players that only honor
+     *       their click handler).
+     *   L3  a REAL injected tap at the video's center - a genuine
+     *       touch reaches even a cross-origin player's own
+     *       handlers, exactly like tapping with the cursor. Only
+     *       attempted with a known target: the fresh poll rect,
+     *       or the WebView center while fullscreen-like. Never
+     *       after L1/L2 landed (that would toggle straight back).
+     *   L4  the media-key injection fallback.
+     *
+     * Real fullscreen (fsView != null) is the one exception: it
+     * keeps its existing behavior - the L4 key is injected and
+     * lands in handleFullscreenKey as the FS center tap.
+     * Every layer logs its result verbatim under HeckYeahFS, and
+     * exactly one final "playpause via=..." line names the layer
+     * that carried the press.
+     */
+    private void togglePlayPause(final String source) {
+        final String src = "phone".equals(source) ? "phone" : "key";
+        Log.d("HeckYeahFS", "playpause src=" + src);
+        final long actionAt = SystemClock.uptimeMillis();
+        if (actionAt - lastPlayPauseAt < 300) {
+            Log.d("HeckYeahFS", "playpause src=" + src + " result=ignored-guard");
+            return;
+        }
+        lastPlayPauseAt = actionAt;
+        if (webView == null || currentScreen != browserPane || browserDialogDepth != 0) {
+            Log.d("HeckYeahFS", "playpause L1 js result=skip:not-browser");
+            Log.d("HeckYeahFS", "playpause via=none");
+            return;
+        }
+        if (fsView != null) { // real fullscreen: existing tap behavior via the key
+            mediaKeyPlayPause(src);
+            return;
+        }
         try {
-            webView.evaluateJavascript(
-                "(function(){try{var v=document.querySelector('video');"
-                + "if(v){if(v.paused){v.play();}else{v.pause();}}}catch(e){}})()", null);
-        } catch (Exception ignored) {}
+            webView.evaluateJavascript(TOGGLE_PLAY_JS, value -> {
+                if (currentScreen != browserPane || fsView != null) {
+                    Log.d("HeckYeahFS", "playpause via=none");
+                    return;
+                }
+                String s = unquoteJs(value);
+                if (s == null || s.isEmpty()) s = "none:empty";
+                Log.d("HeckYeahFS", "playpause L1 js result=" + s);
+                if ("js-paused".equals(s) || "js-played".equals(s)) {
+                    Log.d("HeckYeahFS", "playpause via=js");
+                    // v1.26: flash the RESULTING state.
+                    showActionFeedback(fbBitmap("js-paused".equals(s) ? "pause" : "play"));
+                    schedulePlayPausePostSample(src, "js", true);
+                } else {
+                    runPlayPauseClickLayer(src);
+                }
+            });
+        } catch (Exception e) {
+            Log.d("HeckYeahFS", "playpause L1 js result=exception:"
+                    + e.getClass().getSimpleName());
+            runPlayPauseClickLayer(src);
+        }
+    }
+
+    /** L2: JS-dispatched click on the largest reachable video. */
+    private void runPlayPauseClickLayer(final String src) {
+        if (webView == null || currentScreen != browserPane || fsView != null) {
+            Log.d("HeckYeahFS", "playpause via=none");
+            return;
+        }
+        try {
+            webView.evaluateJavascript(CLICK_PLAY_JS, value -> {
+                if (currentScreen != browserPane || fsView != null) {
+                    Log.d("HeckYeahFS", "playpause via=none");
+                    return;
+                }
+                String s = unquoteJs(value);
+                if (s == null || s.isEmpty()) s = "none:empty";
+                Log.d("HeckYeahFS", "playpause L2 click result=" + s);
+                if ("click-paused".equals(s) || "click-played".equals(s)) {
+                    Log.d("HeckYeahFS", "playpause via=click");
+                    schedulePlayPausePostSample(src, "click", false);
+                } else if (!runPlayPauseTapLayer(src)) {
+                    mediaKeyPlayPause(src);
+                }
+            });
+        } catch (Exception e) {
+            Log.d("HeckYeahFS", "playpause L2 click result=exception:"
+                    + e.getClass().getSimpleName());
+            if (!runPlayPauseTapLayer(src)) mediaKeyPlayPause(src);
+        }
+    }
+
+    /**
+     * L3: a genuine tap through the existing Instrumentation path
+     * (dispatchTap). Returns false - and taps NOTHING - when no
+     * target is known: no fresh poll rect and not fullscreen-like.
+     */
+    private boolean runPlayPauseTapLayer(final String src) {
+        float[] pt = playPauseTapPoint();
+        if (pt == null) {
+            Log.d("HeckYeahFS", "playpause L3 tap result=skip:no-target");
+            return false;
+        }
+        int x = Math.round(pt[0]), y = Math.round(pt[1]);
+        Log.d("HeckYeahFS", "playpause L3 tap result=tap x=" + x + " y=" + y);
+        dispatchTap(pt[0], pt[1]);
+        if (fsLikeActive()) pokeFsCursor(); // the tap is interaction, like a cursor tap
+        Log.d("HeckYeahFS", "playpause via=tap x=" + x + " y=" + y);
+        schedulePlayPausePostSample(src, "tap", false);
+        return true;
+    }
+
+    /**
+     * The L3 target, in WINDOW coordinates (dispatchTap's space).
+     * Fresh poll data (<2s) wins: the poll's viewport rect is CSS
+     * px in the top page, so its center converts with
+     * webView.getScale() - the same conversion the scroll-lock
+     * math uses - plus the WebView's window offset. With no rect
+     * but a fullscreen-like state (pseudo-FS), the WebView center
+     * is the video by definition. Otherwise null: never tap
+     * blindly.
+     */
+    private float[] playPauseTapPoint() {
+        if (webView == null) return null;
+        int[] loc = new int[2];
+        webView.getLocationInWindow(loc);
+        boolean fresh = videoDataAt > 0
+                && System.currentTimeMillis() - videoDataAt < 2000;
+        if (fresh && videoFound && vidViewR > vidViewL && vidViewB > vidViewT) {
+            float scale = webView.getScale();
+            if (scale <= 0f) scale = 1f;
+            float cx = (vidViewL + vidViewR) / 2f * scale;
+            float cy = (vidViewT + vidViewB) / 2f * scale;
+            float x = loc[0] + clampF(cx, 0f, webView.getWidth());
+            float y = loc[1] + clampF(cy, 0f, webView.getHeight());
+            return new float[]{x, y};
+        }
+        if (fsLikeActive()) {
+            return new float[]{loc[0] + webView.getWidth() / 2f,
+                    loc[1] + webView.getHeight() / 2f};
+        }
+        return null;
+    }
+
+    /**
+     * L4 (and the real-fullscreen route): inject MEDIA_PLAY_PAUSE
+     * through the v1.23 instrumentation path. dispatchKeyEvent is
+     * armed to let this one key fall through to the WebView (see
+     * mediaKeyPassThrough), where Chromium's media-session
+     * handling may toggle the active media element. In real
+     * fullscreen the key instead lands in handleFullscreenKey,
+     * whose center tap is the FS toggle, so the same injection
+     * serves both states.
+     */
+    private void mediaKeyPlayPause(final String src) {
+        Log.d("HeckYeahFS", "playpause L4 mediakey result=inject src=" + src);
+        mediaKeyPassThrough = true;
+        ui.postDelayed(() -> mediaKeyPassThrough = false, 2000);
+        injectKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE);
+        Log.d("HeckYeahFS", "playpause via=mediakey");
+        schedulePlayPausePostSample(src, "mediakey", false);
+    }
+
+    /**
+     * v1.31: ~450ms after a toggle lands, probe the resulting
+     * state once and log it ("playpause post src=... via=...
+     * state=playing|paused|none"). For the click/tap/mediakey
+     * layers this sample is also the feedback source (v1.26's
+     * rule, kept): flash play/pause only when the probe provably
+     * names the new state - cross-origin players answer "none"
+     * and stay silent rather than flashing a guess. The JS layer
+     * already flashed its known result, so it only logs. In real
+     * fullscreen the probe is not run (the FS view owns the
+     * video; v1.26 stayed silent there too).
+     */
+    private void schedulePlayPausePostSample(final String src, final String via,
+                                             final boolean iconShown) {
+        ui.postDelayed(() -> {
+            if (currentScreen != browserPane || webView == null) {
+                Log.d("HeckYeahFS", "playpause post src=" + src + " via=" + via
+                        + " state=unknown:screen");
+                return;
+            }
+            if (fsView != null) {
+                Log.d("HeckYeahFS", "playpause post src=" + src + " via=" + via
+                        + " state=unknown:real-fullscreen");
+                return;
+            }
+            try {
+                webView.evaluateJavascript(PLAY_STATE_JS, value -> {
+                    String s = unquoteJs(value);
+                    if (s == null || s.isEmpty()) s = "none";
+                    Log.d("HeckYeahFS", "playpause post src=" + src + " via=" + via
+                            + " state=" + s);
+                    if (iconShown) return;
+                    if ("playing".equals(s)) showActionFeedback(fbBitmap("play"));
+                    else if ("paused".equals(s)) showActionFeedback(fbBitmap("pause"));
+                });
+            } catch (Exception e) {
+                Log.d("HeckYeahFS", "playpause post src=" + src + " via=" + via
+                        + " state=unknown:exception");
+            }
+        }, 450);
     }
 
     private void moveCursor(float dx, float dy) {
+        // v1.32 watchdog: movement is the one input that ALWAYS
+        // flows while the cursor should exist (D-pad keys and the
+        // phone's remoteMove both funnel through here). If the
+        // cursor should be visible but isn't - GONE, or alpha 0
+        // outside a legitimate fsLike fade - heal it on the spot
+        // instead of trusting that some transition restored it.
+        if (cursorView != null && currentScreen == browserPane && browserMouse
+                && (cursorView.getVisibility() != View.VISIBLE
+                    || (!(fsLikeActive() && cursorFaded)
+                        && cursorView.getAlpha() < 0.99f)))
+            refreshCursor("watchdog-move");
         // v1.17: any cursor movement is interaction for the
         // fullscreen cursor fade. Outside fullscreen-like state
         // this is a no-op by construction: cursorFaded is false so
@@ -4679,25 +6818,60 @@ public class MainActivity extends Activity {
                 doScrollBy(0, -dp(140)); // v1.15: the bounded scroll area applies here too
         }
         cursorView.invalidate();
+        updateToolbarHover(); // v1.25: name bubble follows the cursor over the toolbar
     }
 
+    /**
+     * Tap at window coordinates (x, y) - the cursor's own space.
+     * Callers pass cursor or WebView-window coordinates; the
+     * window is fullscreen, so display coordinates are these plus
+     * the root view's on-screen offset (converted explicitly).
+     */
     private void dispatchTap(float x, float y) {
-        long now = SystemClock.uptimeMillis();
-        MotionEvent down = MotionEvent.obtain(now, now, MotionEvent.ACTION_DOWN, x, y, 0);
-        MotionEvent up = MotionEvent.obtain(now, now + 50, MotionEvent.ACTION_UP, x, y, 0);
-        windowRoot.dispatchTouchEvent(down); windowRoot.dispatchTouchEvent(up);
-        down.recycle(); up.recycle();
+        hideToolbarTip(); // v1.25: a click dismisses any name bubble
+        // v1.28: the pairing CARD claims taps before the page sees
+        // them - inside its rect runs the card action and NO page
+        // tap is injected; a tap anywhere else dismisses the card
+        // and then proceeds normally (not consumed).
+        if (pairCardVisible && currentScreen == browserPane && fsView == null) {
+            if (pairCardContains(x, y)) { pairCardAction(); return; }
+            hidePairCard();
+        }
+        float sx = x, sy = y;
+        if (windowRoot != null) {
+            int[] loc = new int[2];
+            windowRoot.getLocationOnScreen(loc);
+            sx += loc[0]; sy += loc[1];
+        }
+        injectPointer(sx, sy, 40, "tap",
+                () -> viewDispatchTap(windowRoot, x, y),
+                () -> viewDispatchUp(windowRoot, x, y));
     }
 
+    /**
+     * Long-press at window coordinates: a genuine injected hold
+     * (DOWN, ~550ms on the injection thread, UP), so the WebView
+     * sees a real long press and its link menu flow works as with
+     * a finger - and a native popup item can be long-pressed too.
+     */
     private void dispatchLongTap(final float x, final float y) {
-        long now = SystemClock.uptimeMillis();
-        MotionEvent down = MotionEvent.obtain(now, now, MotionEvent.ACTION_DOWN, x, y, 0);
-        windowRoot.dispatchTouchEvent(down); down.recycle();
-        ui.postDelayed(() -> {
-            long upNow = SystemClock.uptimeMillis();
-            MotionEvent up = MotionEvent.obtain(upNow, upNow, MotionEvent.ACTION_UP, x, y, 0);
-            windowRoot.dispatchTouchEvent(up); up.recycle();
-        }, 650);
+        hideToolbarTip(); // v1.25: a click dismisses any name bubble
+        // v1.28: same pairing-card claim as dispatchTap - a long
+        // press on the card is the card action, never a page
+        // long-press under it.
+        if (pairCardVisible && currentScreen == browserPane && fsView == null) {
+            if (pairCardContains(x, y)) { pairCardAction(); return; }
+            hidePairCard();
+        }
+        float sx = x, sy = y;
+        if (windowRoot != null) {
+            int[] loc = new int[2];
+            windowRoot.getLocationOnScreen(loc);
+            sx += loc[0]; sy += loc[1];
+        }
+        injectPointer(sx, sy, 550, "longtap",
+                () -> viewDispatchLongTap(x, y),
+                () -> viewDispatchUp(windowRoot, x, y));
     }
 
     private class CursorView extends View {

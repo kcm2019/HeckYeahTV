@@ -77,6 +77,8 @@ public class RemoteServer {
         void remoteUrl(String u);
         void remoteType(String text);
         void remoteEnterKey();
+        /** v1.22: D-pad mode key: up|down|left|right|ok|back|menu. */
+        void remoteKey(String k);
         void remoteVolume(int dir);
         void remoteSeek(int seconds);
         void remoteSessionsChanged();
@@ -378,7 +380,11 @@ public class RemoteServer {
         sb.append("HTTP/1.1 ").append(code).append(' ').append(reason).append("\r\n");
         sb.append("Content-Type: ").append(contentType).append("\r\n");
         sb.append("Content-Length: ").append(body.length).append("\r\n");
-        sb.append("Cache-Control: no-store\r\n");
+        // v1.32: no-store + must-revalidate. The pairing URL is
+        // versioned (?v=<versionCode>) so a phone tab restored
+        // from a snapshot at the OLD address cannot silently keep
+        // running a stale copy of the remote page.
+        sb.append("Cache-Control: no-store, must-revalidate\r\n");
         sb.append("Connection: close\r\n");
         if (extraHeaders != null) sb.append(extraHeaders);
         sb.append("\r\n");
@@ -648,10 +654,20 @@ public class RemoteServer {
                     ui.post(() -> host.remoteType(text));
                     break;
                 }
-                case "key":
-                    if ("enter".equals(o.optString("k", "")))
+                case "key": {
+                    // "enter" is the v1.19 type-field Enter (page JS);
+                    // v1.22 adds physical-remote keys for D-pad mode.
+                    final String k = o.optString("k", "");
+                    if ("enter".equals(k)) {
                         ui.post(() -> host.remoteEnterKey());
+                    } else if ("up".equals(k) || "down".equals(k)
+                            || "left".equals(k) || "right".equals(k)
+                            || "ok".equals(k) || "back".equals(k)
+                            || "menu".equals(k)) {
+                        ui.post(() -> host.remoteKey(k));
+                    }
                     break;
+                }
                 case "vol": {
                     final int d = o.optInt("d", 0);
                     ui.post(() -> host.remoteVolume(d));
