@@ -183,13 +183,20 @@ web page the app itself serves — no phone app to install.
   remote control uses (`moveCursor`, `dispatchTap`/
   `dispatchFsTap`, `doScrollBy`, `loadResolved`, `togglePlayJs`,
   `closeBrowser`), so every clamp and freeze applies unchanged.
-- **Pairing/security:** 4-digit PIN shown on the TV (regenerated
-  at every server start); POST /pair issues an in-memory session
-  cookie (max **2** phones — extra E), 5 failed attempts lock
-  pairing for 60 s. Tokens never touch storage: restarts re-pair.
-  The TV pairing panel (browser menu / browser settings →
-  "Phone remote…") shows address, PIN, QR, paired count, and
-  "New PIN" / "Disconnect all" controls.
+- **Pairing/security:** (v1.37, compare-and-pair; the original
+  4-digit typed PIN is gone) the phone requests pairing
+  (POST /pair/start) and a one-time 6-digit code appears on BOTH
+  the phone and the TV; either side confirms (phone Pair tap via
+  POST /pair/confirm, bound to a per-request id + secret client
+  key, or OK on the TV). Requests expire in 60 s, one pending at
+  a time; approval issues an in-memory session cookie (max **2**
+  phones — extra E). The phone never submits the code, so there
+  is nothing to guess; /pair/start is throttled per source IP
+  (>5 starts in 60 s → blocked 60 s). Tokens never touch
+  storage: restarts re-pair. The TV pairing panel (browser menu
+  / browser settings → "Phone remote…") shows address, QR,
+  paired count, the pending request's code with Pair/Deny, and
+  "Reset pairing" / "Disconnect all" controls.
 - **A. QR code** on the panel encoding the address (in-app QR
   generator, ECC level M, verified standalone on a desktop JVM).
 - **B. mDNS:** the service is advertised as "HeckYeah TV"

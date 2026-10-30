@@ -24,8 +24,8 @@ in-app browser built for D-pad and mouse-style remote navigation.
 - Phone remote: a web page served by the app lets a phone on the
   same Wi-Fi control the whole app — an Apple TV Remote-style
   page with a trackpad for the browser and a clickpad D-pad for
-  the menus — paired with a PIN shown on the TV — see
-  "Phone remote" below
+  the menus — paired by matching a code shown on both screens
+  — see "Phone remote" below
 
 ## Requirements
 
@@ -61,12 +61,16 @@ adb shell monkey -p com.heckyeah.tv -c android.intent.category.LAUNCHER 1
 
 With **Settings → Phone remote** turned on, the app serves a
 control page on your local network at `http://<device-ip>:18765`.
-Open it in a phone browser (no app to install), enter the 4-digit
-PIN shown on the TV in the pairing panel (opened from **Home →
-Phone**, the browser toolbar's **Phone** button, or the browser
-menu — and, since v1.27, it also pops up by itself for 10
-seconds when the browser opens with no phone paired), and the
-phone becomes a full remote for the app. The page
+Open it in a phone browser (no app to install) and it pairs by
+compare-and-confirm (since v1.37; the pairing panel itself is
+opened from **Home → Phone**, the browser toolbar's **Phone**
+button, or the browser menu — and, since v1.27, a pairing card
+also pops up by itself briefly when the browser opens with no
+phone paired): the phone requests pairing, a one-time 6-digit
+code appears on the phone AND on the TV, you check they match,
+and either side confirms — tap **Pair** on the phone or press
+OK on the TV. Nothing is ever typed. The phone then becomes a
+full remote for the app. The page
 is styled after Apple's TV Remote app and switches modes
 automatically: in the browser it is a trackpad (cursor movement,
 taps and long-presses, scrolling, Back / Forward / Reload /
@@ -78,7 +82,8 @@ and dialogs included. A segmented control on the page can
 override the mode until the TV's screen next changes. ±10-second
 seek and volume work in both modes. The TV panel also shows a
 QR code for the address and the paired-phone count (up to 2),
-and can regenerate the PIN or disconnect all phones.
+shows any pending pairing request with its code and Pair/Deny
+buttons, and can reset pairing or disconnect all phones.
 
 Permissions used by this feature (both normal Android
 permissions): `ACCESS_WIFI_STATE` (to display the device's Wi-Fi
@@ -86,11 +91,14 @@ address in the pairing panel) and `MODIFY_AUDIO_SETTINGS` (the
 phone's volume buttons).
 
 **Security:** the remote is **off by default**. It is a
-LAN convenience, not an internet service: pairing requires the
-PIN shown on the TV, the PIN is regenerated at every server
-start, session tokens live in memory only (a restart means
-re-pairing), and 5 failed pairing attempts lock pairing for 60
-seconds. Anyone who can see the TV screen and reach the device
+LAN convenience, not an internet service: pairing requires
+physically comparing a one-time 6-digit code shown on both the
+phone and the TV and confirming on either side (the phone
+never submits the code, so there is nothing to brute-force;
+requests expire in 60 seconds, only one can be pending, and
+pairing starts are throttled per source IP), and session
+tokens live in memory only (a restart means re-pairing).
+Anyone who can see the TV screen and reach the device
 on your network can pair — turn it off on networks you do not
 trust.
 
@@ -233,6 +241,494 @@ export KEYSTORE_PASS='change-me'
 export KEY_PASS="$KEYSTORE_PASS"
 ./build.sh   # → build/manual/apk/HeckYeah.apk
 ```
+
+## v1.40 (Oct 30, 2026) — D-pad hold killers removed, latched edge scrolling, nav bar fades with cursor in fullscreen
+
+Three more field reports from Kurt on v1.39.
+
+**Fix 1: D-pad hold still died after ~3 steps.** The TV repeat
+engine from v1.39 was sound; two killers were still live in the
+shipped page:
+
+- The clickpad `touchmove` handler still ran flick recognition
+  for zone-started touches: at ≥44 px of drift from the press
+  point it set `cpSwipeFired` and called `stopRepeat()` →
+  `stopKeyHold()` (`h:0`). A thumb settling into a hold drifts
+  44 px (~7 mm) in ~0.3–0.6 s — exactly "initial step + repeats
+  at 350/460 ms = 3 steps, then dies", and the same 44 px cancel
+  had been there since v1.23, which is why the step count never
+  changed across versions. Now, when a touch press-fired a
+  direction zone (`cpPressFired`), `touchmove` does nothing at
+  all. Flick recognition survives only for touches that did not
+  press-fire (OK / gaps between zones). A flick from a zone
+  releases before the TV's first repeat (350 ms), so it still
+  yields exactly one step; distance travelled while the finger
+  is down cannot distinguish flick from hold.
+- `applyMode()` called `stopRepeat()` unconditionally on its
+  first line, and `handleState()` calls `applyMode()` on every
+  state push (2.5 s heartbeat included) — any hold that survived
+  the first killer was guillotined by the next push. The stop
+  now sits inside the existing real-mode-change gate
+  (`lastAppliedMode !== mode`), alongside `collapsePanels()`;
+  genuine switches (seg buttons, mode auto-follow) still stop
+  holds because the mode actually differs there.
+
+Protocol, TV engine, stop conditions, and `keyrepeat` logs are
+otherwise exactly as v1.39.
+
+**Fix 2: edge-push scrolling rearchitected as a latch.** On
+device the v1.39 scroll still died when the finger stopped
+moving (the heartbeat chain read correct end-to-end, yet the
+scroll died anyway), and 260 px/s read as very slow. The push
+no longer depends on freshness at all:
+
+- The edge loop's stop conditions are now: the cursor leaves
+  the edge (per-axis geometry drop) or a move reverses the axis;
+  the existing transition stops (screen / mode / fullscreen /
+  PiP / page load); a new wind-down deadline (`edgeStopAt`,
+  150 ms glide-out) armed by input release — the phone's touch
+  lift (`remoteTouch(false)`) or a physical arrow `ACTION_UP`
+  in the mouse-mode key branch (arrow ups were previously
+  unhandled there); a deliberate phone command (tap, long-tap,
+  two-finger scroll, key, key-hold, Done — `remoteMove`, the
+  holder's own stream, is exempt); and a 20 s absolute cap,
+  logged `edge push stop why=cap`, bounding any lost stop
+  (e.g. the phone dying mid-hold with the cursor parked at an
+  edge). Fresh moves (`noteEdgePush`) and the engagement
+  heartbeat (`remoteTouch(true)`) clear the deadline —
+  engagement re-asserted — and the heartbeat never creates a
+  push by itself.
+- Speed: 260 → **400 px/s** vertical, 200 → **300 px/s**
+  horizontal (~0.37 viewport/s); ramp base stays 35%, span
+  600 → 500 ms. `doScrollBy` and its clamps, the two-finger
+  scroll chain, cursor gain, and the top-edge/header-reveal
+  recording are untouched.
+
+**Fix 3: the browser nav bar auto-hides with the cursor fade
+in fullscreen.** Entering fullscreen restores the bar, and
+until now nothing hid it again until a scroll/tap path did —
+it stayed on top of the video. The fullscreen idle fade
+(`fsFadeRunnable`, 5 s, `CURSOR_FADE_MS`) now has a header
+half alongside the cursor half:
+
+- When the fade fires in a fullscreen-like state and the bar
+  is shown, it hides the bar too and remembers it
+  (`headerFadeHidden`). The next interaction — `pokeFsCursor()`
+  is already called from every interaction path (cursor moves,
+  taps, keys, phone input) — restores the bar with the cursor,
+  same gesture. Logged as `header fade hide` / `header fade
+  show` under HeckYeahFS.
+- The fade is now armed whenever a fullscreen-like state is
+  active, in both sub-modes (previously mouse only), so the bar
+  also idle-hides in D-pad sub-mode; the cursor half stays
+  mouse-gated inside the runnable, and `cursorFaded` is never
+  set in D-pad mode, so `refreshCursor`'s legit-fade logic is
+  unaffected. Fullscreen exit paths (which funnel through
+  `cancelFsFade()` + `showHeader(false)`) clear the flag, and
+  PiP entry still stops fullscreen first (`startPip` calls
+  `hideFullscreen()`), so the PiP header save/restore flags
+  snapshot a restored bar, exactly as before. Scroll-driven
+  hide/show outside fullscreen is untouched; pseudo-fullscreen
+  already hid its bar at entry, so the fade's header half
+  no-ops there.
+
+## v1.39 (Oct 30, 2026) — TV-owned D-pad hold repeat + slow continuous edge scrolling
+
+Two field reports from Kurt on v1.38.
+
+**Report 1: holding a phone D-pad direction still stopped after
+~3 steps.** The v1.23 phone-side hold-to-repeat (an interval
+stream of `{t:"key"}` messages) died mid-hold somewhere in the
+page → socket → injection chain, and the page also carried two
+mid-hold kill paths (a touchmove slide-off check via
+`elementFromPoint`, and the flick recognizer cancelling the
+repeat). Repeat ownership moved to the TV:
+
+- **Protocol:** `{t:"key", k:"up|down|left|right", h:1}` =
+  hold start, `h:0` = release (RemoteServer routes these to a
+  new `Host.remoteKeyHold`). Messages without `h` keep their
+  exact single-fire meaning, so old pages/new servers degrade
+  to single taps.
+- **TV repeat engine (MainActivity):** hold start injects the
+  key once immediately via the existing `injectKey()`, then a
+  ui-Handler loop repeats it — first repeat after 350 ms, then
+  every 110 ms — so repeats flow through `dispatchKeyEvent`
+  exactly like a physical remote's: Home focus steps, browser
+  D-pad page scroll, and mouse-mode cursor moves all repeat
+  from one mechanism. Stops on: release (`why=release`), a new
+  hold (`replace`), any plain key (`plainkey`), sessions
+  dropping to 0 / server stop (`disconnect`), an 8 s hard cap
+  (`cap`, so a lost release can't scroll forever), and
+  `onDestroy` (`destroy`) — logged as `keyrepeat start/stop`
+  under HeckYeahFS.
+- **Phone page:** direction zones now send h:1/h:0 only;
+  `stopKeyHold()` is funnelled through the existing
+  `stopRepeat()`, so every established stop path (touchend,
+  touchcancel, mouseup, clickpad mouseleave, window blur, mode
+  switch, current-socket close, flick recognition, a replacing
+  press) releases the hold. The touchmove slide-off check and
+  the per-zone mouseleave kill are deleted — a hold is a hold
+  until release. A zone-started touch that becomes a flick just
+  ends the hold early (h:0, no second key), preserving the
+  "flick doesn't double-fire" rule; flicks starting off a zone
+  are unchanged. The volume rocker keeps its phone-side repeat,
+  untouched. A quick tap on a zone is still exactly one key.
+
+**Report 2: edge-push scrolling arrived as a few jumps.**
+v1.35's push died 120 ms after the last move *event* — a
+finger held still against the edge sends no events — and
+700 px/s was faster than wanted. Now:
+
+- **Slower:** velocity 700 → 260 px/s vertical, 520 → 200
+  horizontal (≈0.24 viewport/sec); ramp 45 %→100 % over 400 ms
+  became 35 %→100 % over 600 ms. A quick brush against the
+  edge nudges ~25–30 px.
+- **Continuous while engaged:** freshness 120 → 450 ms, and
+  the phone now sends a touch-engagement heartbeat —
+  `{t:"touch", d:1}` on the first trackpad touch, re-sent
+  every 200 ms while any finger is down, `{d:0}` when the
+  last finger lifts (RemoteServer → new `Host.remoteTouch`).
+  `remoteTouch(true)` only *refreshes* a recorded push (it
+  never creates one); `remoteTouch(false)` backdates the push
+  to ~150 ms of remaining freshness — a crisp wind-down, not a
+  cliff. Sustained: a still finger at the edge scrolls at
+  260 px/s indefinitely until it lifts; release stops within
+  ~150–450 ms. Physical-remote holds are unchanged (their
+  key-repeat `moveCursor` calls keep recording pushes).
+- Tick dt clamp raised 64 → 100 ms so a coalesced tick keeps
+  an honest rate. Everything else about the loop is as v1.35:
+  axis-drop on edge-leave, reverse-move cancel, all
+  `stopEdgePush()` transitions, `doScrollBy` untouched.
+
+Regression guards held: the two-finger trackpad scroll chain
+is behavior-identical (the heartbeat is additive messages
+only — no change to move/scroll sending, `SCROLL_FACTOR`, or
+the accumulators); cursor speed/gain unchanged;
+compare-and-pair and the v1.38 session-check logic untouched;
+both PiP kinds untouched.
+
+## v1.38 (Oct 30, 2026) — fix double pairing prompt (socket/reconnect race + session check)
+
+Kurt's on-device report on v1.37: pairing succeeded, then the
+SAME phone was prompted to pair a second time in the same
+session (pairing again worked). Root cause, verified by code
+audit of remote.html: one race family.
+
+- **The WebSocket handlers were not socket-scoped.** `connect()`
+  replaced the global `ws`, but the OLD socket's `onclose` /
+  `onerror` fired asynchronously afterwards and mutated global
+  state unconditionally — `onerror` called
+  `showPairingOverlay()` directly (firing a second
+  `/pair/start`), and `onclose` nulled `ws` and armed reconnects.
+  Leftover reconnect timers armed by the original unpaired 401
+  close could likewise fire `connect()` after pairing and close
+  the good socket, whose unguarded handlers then splashed the
+  overlay again. After the second pairing no stale actors
+  remained, so it stuck.
+- **Socket ownership (remote.html).** A `wsGen` generation
+  counter plus a per-socket captured reference: every handler
+  (`onopen`/`onmessage`/`onclose`/`onerror`) first checks
+  `sock !== ws` and returns — a superseded socket is completely
+  inert. `connect()` is single-flight (a CONNECTING/OPEN socket
+  is never closed by a reconnect timer; the timer callback
+  re-validates before connecting) except for the forced
+  post-pair path, where a socket started before the session
+  cookie existed is known-doomed and is recreated exactly once.
+- **Proof before pairing UI.** `onerror` no longer shows
+  anything — a socket error carries no evidence the session is
+  invalid, and `onclose` always follows it. A socket that had
+  opened reconnects silently (the cookie re-authenticates). A
+  socket that never opened triggers the new server endpoint
+  `GET /pair/session` (RemoteServer: parses the `hy` cookie
+  exactly like the WS upgrade; 200 = live session, 401 = not):
+  200 or a network failure reconnects quietly; only a proven
+  401 may show the pairing overlay — Kurt's rule: once paired,
+  the page must not ask to re-pair until the session is
+  actually gone. The async check result is generation-guarded
+  so a stale answer can't act. All pair fetches now pass
+  `credentials: "same-origin"` explicitly, and `onPaired()`
+  clears every pending reconnect timer before connecting, so
+  exactly one new socket results from a pairing.
+- The compare-and-pair protocol itself (codes, dual confirm,
+  endpoints, TV card/panel) is unchanged.
+
+## v1.37 (Oct 30, 2026) — compare-and-pair phone pairing (no typed PIN)
+
+The typed 4-digit PIN is gone, replaced end to end (not bolted
+on) with Kurt's compare-and-pair flow:
+
+- **New protocol (RemoteServer).** The server-wide PIN is
+  replaced by per-request pairing state, all transitions
+  guarded by one lock: `POST /pair/start` creates the single
+  pending request (UUID id, a secret per-request client key
+  returned ONLY to the starting phone, a random 6-digit code,
+  60 s expiry, source IP captured) — 403 when both session
+  slots are taken, 409 when another request is already
+  pending. `GET /pair/status?id&key` polls: pending with the
+  remaining seconds, approved (session token delivered via
+  the `hy` Set-Cookie; re-deliverable to the same id+key for
+  ~60 s so a lost response can't strand the phone),
+  denied, or expired (410). `POST /pair/confirm {id,key}` is
+  the phone's Pair tap — idempotent, a double approval returns
+  the same token, never two sessions. `POST /pair/cancel`
+  retires the request. TV side: `pendingPairCode()`,
+  `pendingPairExpiresInMs()`, `approvePendingFromTv()`,
+  `denyPendingFromTv()`, `resetPairingAndDropSessions()`, and
+  a new Host callback `remotePairingChanged()`. `pin()` and
+  the old POST /pair are deleted outright.
+- **No guessing surface, new abuse control.** The phone never
+  submits the code (confirm is bound to id+key from the start
+  response; the TV button is local), so the old 5-fail PIN
+  lockout is replaced by a per-source-IP start throttle:
+  more than 5 `/pair/start` calls within 60 s blocks that IP
+  for 60 s. Approvals after expiry/denial fail cleanly;
+  `stop()` cancels any pending request.
+- **Phone page.** The PIN input and all typed-PIN logic are
+  deleted. The overlay runs a small state machine: on show it
+  starts one request ("Requesting a pairing code…"), then
+  shows the code BIG and grouped 3+3 in accent, "Make sure
+  this code matches the one on your TV.", a live 1 s countdown
+  ("Code expires in 0:47") and a 1 s status poll — a TV
+  approval is picked up by the poll (cookie included), hides
+  the overlay and connects. Pair/Cancel buttons; failures
+  surface the server's reason with "Get a new code"; cancel
+  parks on "Pairing cancelled" with "Try again"; expiry parks
+  on "Code expired". The WebSocket reconnect loop is PAUSED
+  while the pairing UI is active — no 401 spinning behind it.
+- **TV card.** The auto pairing card gains a PENDING mode:
+  label "PHONE PAIRING", title "Pair this phone?", the code
+  big and grouped 3+3 (tag "CODE"), QR/address hidden, body
+  "Check the code matches your phone, then press OK here — or
+  tap Pair on the phone.", and the countdown is the request's
+  own remaining life ("Expires in Ns", drain animator
+  re-spanned on every refill). A NEW request auto-shows the
+  card when the browser is current, no dialog is open and
+  we're not in real fullscreen. OK/tap on a pending card
+  approves (the sessions-changed path runs the success
+  treatment, so phone/TV confirms can't double-celebrate);
+  BACK only hides the card — denial lives in the panel. Idle
+  mode is unchanged apart from the PIN row: body now reads
+  "Open the remote on your phone — a matching code will appear
+  on both screens.", idle life stays 15 s.
+- **Manual panel.** PIN view and "New PIN" button removed
+  ("Reset pairing" takes the slot, wired to
+  `resetPairingAndDropSessions()`). A pending section shows
+  "Pairing request" + the big grouped code + [Pair this
+  phone] [Deny] (refreshing in place via
+  `remotePairingChanged()`), or one dim idle line when no
+  request is live. The OFF copy and settings comment now say
+  pairing is by matching code.
+- **Unchanged after pairing:** WebSocket auth via the `hy`
+  cookie, broadcast/state pushes, NSD, command dispatch
+  (including the v1.36 PiP pill), max 2 sessions, tokens
+  memory-only, and the v1.21 first-pair video kick — both
+  confirm paths funnel through the same sessions-changed
+  notify.
+
+## v1.36 (Oct 30, 2026) — two-way phone PiP button + PiP size/corner/auto settings
+
+PiP round 2, three parts:
+
+- **The phone remote's PiP pill is now two-way.** In the app
+  (browser current, no PiP) it enters PiP exactly as v1.34.
+  While either PiP floats it is the way *back*: the in-app
+  window resumes, and the native window — even while it floats
+  over the Fire TV Home screen or another app — is expanded by
+  returning to the full app. There is no exit-PiP API on
+  API 24/25; the platform expands a PiP activity when its task
+  comes to the front, so the return path relaunches
+  `MainActivity` with `FLAG_ACTIVITY_REORDER_TO_FRONT` and
+  calls `ActivityManager.moveTaskToFront` (new
+  `REORDER_TASKS` permission — normal, auto-granted). UI
+  restoration stays in the single mode-changed exit path (no
+  double restore). Logs: `pip return why=phone`, then ~700ms
+  later `pip return result=expanded` or
+  `pip return result=still-pip` — the latter is the diagnostic
+  if Fire OS ever behaves differently. The v1.34 rule that
+  Done/new links are no-ops while native PiP floats is
+  unchanged; `{t:"pip"}` dispatch has no gate upstream of
+  `remotePip()`. State pushes gain `"pip": (nativePip ||
+  pipActive)`, and the phone's PiP pill renders lit in the
+  accent color while it's true — it visibly reads as the way
+  back. (State pushes keep flowing while PiP floats: the
+  server and the 2.5s heartbeat live in the activity process,
+  whose main looper runs while the activity is paused.)
+- **Bigger in-app PiP + PiP settings.** Native PiP's window
+  size is chosen by the OS — the API-24 entry point
+  (`enterPictureInPictureMode()`, no-arg) has no size or
+  aspect parameter at all (that only arrived with the API-26
+  params overload, unusable here), so size/corner settings
+  govern the *in-app* window. New prefs: `pip_auto_done`
+  (default ON — when OFF, Done never auto-PiPs; the PiP
+  buttons are unaffected), `pip_size` (Small 384×216 /
+  Medium 512×288 / Large 640×360 dp; default Medium — Small
+  reproduces the v1.33 window), `pip_corner` (Bottom-right
+  default / Bottom-left / Top-right / Top-left, standing 20dp
+  margins). Size and corner re-apply live to a floating
+  in-app window. The same three rows appear in main Settings
+  ("Auto-PiP when leaving with a playing video", "PiP window
+  size", "PiP window corner", plus a dim note that size and
+  corner apply to the in-app window and system PiP size is set
+  by Fire TV) and in the browser gear sheet ("Auto-PiP",
+  "PiP size", "PiP corner") — both edit the same prefs and
+  read them at open/refresh time, so they can't disagree.
+- Regression guard: v1.33 in-app semantics (resume / ✕ /
+  new-link teardown) and the v1.34 native flow are otherwise
+  unchanged; the in-app frame's radius, border, and elevation
+  are untouched apart from size/corner params.
+
+## v1.35 (Oct 30, 2026) — calm, time-based edge-push scrolling for the cursor
+
+Kurt clarified the v1.35 target: two-finger trackpad scrolling
+on the phone remote is "great and smooth" — the runaway was
+*edge-push* scrolling. When the cursor is driven against a
+WebView edge (phone trackpad or physical remote alike, both
+funnel through `moveCursor`), the old code fired a fixed
+`doScrollBy` step per move event — dp(140) ≈ 280px vertical,
+dp(80) ≈ 160px horizontal — plus a second dp(140) per event
+from the v1.11 top-edge rule while pinned at the top. At the
+physical remote's key-repeat rate that's brisk; at the phone
+trackpad's ~60 events/sec touchmove stream it's
+60 × 280 ≈ 16,800 px/sec: the page teleports.
+
+Edge pushing is now time-based with a capped velocity:
+
+- A move event that crosses an edge under exactly the old
+  geometric conditions (WebView-rect crossing for bottom /
+  left / right, plus the cursor-keyed v1.11 top rule with its
+  transit dedup — now structural, since recording a push is
+  idempotent) records an *edge push* — direction + timestamp —
+  instead of scrolling on the spot. Moving away from an edge
+  cancels its push; the header-reveal trigger at the top edge
+  is unchanged.
+- One Handler loop (~16ms ticks) scrolls while a push is
+  fresh (last push event within 120ms) and the cursor is still
+  at/past that edge, applying velocity × dt through the
+  existing `doScrollBy` — so the document clamp and the
+  video-bounded scroll area govern every tick exactly as
+  before. Velocities (raw px/sec): vertical 700 (≈0.65 of the
+  1080px viewport per second), horizontal 520. The first
+  ~400ms of a continuous push ramps from 45% to full velocity,
+  so a brush against the edge nudges and a deliberate hold
+  glides.
+- The loop stops when pushes go stale, the cursor leaves the
+  edge, or the context changes — it is explicitly stopped on
+  screen changes, mouse/D-pad mode toggles, page loads,
+  browser close, fullscreen entry, and PiP entry (both kinds);
+  a single leaked loop is impossible (one Runnable, reposted
+  only while running).
+- Feel arithmetic: one D-pad tap against an edge = one push
+  event ≈ a 120ms freshness window at ramped velocity
+  ≈ 45px of scroll (was 280px per tap, doubled at the top
+  edge); a sustained phone push scrolls ≈0.65 viewport/sec
+  vertically after the ramp. Unchanged: cursor speed/gain on
+  both inputs, two-finger trackpad scrolling (byte-identical
+  to v1.34), PgUp/PgDn/FF/Rew steps, D-pad-mode page scrolling,
+  and `doScrollBy` itself.
+
+## v1.34 (Oct 30, 2026) — native TV picture-in-picture + PiP buttons (nav bar + phone remote)
+
+The v1.33 premise — "API 25 has no system PiP" — was wrong for
+televisions: phone PiP is API 26, but TV picture-in-picture
+(`Activity.enterPictureInPictureMode()`, the no-arg form) exists
+since API 24, and SmartTube uses it on this Fire TV today. Native
+PiP is now the primary PiP; the v1.33 in-app window stays as the
+fallback when the device lacks the feature or the call refuses.
+
+- **(Part 1) Native TV PiP.** The manifest declares
+  `supportsPictureInPicture` and the PiP `configChanges`
+  (`smallestScreenSize|screenLayout` added) so the activity is
+  never recreated across the transition. One unified entry,
+  `startPip(why)`, serves the Done gate, the new nav-bar button
+  and the phone pill: it tries native first, falls back to the
+  in-app `enterPip()` untouched, and logs the branch
+  (`pip start why=<why> mode=native|inapp|none`) under
+  `HeckYeahFS`. On entering native PiP the header hides (prior
+  state remembered and restored on exit), the pairing card,
+  tooltip, feedback flash and any open dialog are dismissed, and
+  the cursor is forced hidden for the duration
+  (`refreshCursor`'s show condition gained `!nativePip`).
+  Lifecycle audit: the activity sits in the paused state while
+  the window floats, so `onPause()` now exempts native PiP —
+  the WebView is never paused under the window — and header
+  show/hide churn (scroll, top-edge reveal) is suppressed while
+  it floats. While native PiP is active, a phone Done is a
+  logged no-op and a phone-sent new link is logged and ignored;
+  the system's own PiP affordances own the window. The poll also
+  learned to report a paused-but-present video (new `p` flag;
+  `videoFound` still means *playing*, so scroll-lock semantics
+  are unchanged) for the button gating below.
+- **(Part 2) PiP button in the TV nav bar.** Per Kurt's
+  placement: a third segment in the left cluster —
+  Back | Forward | PiP, immediately right of Forward. New
+  `strokeIcon("pip")` glyph in the family discipline (stroked
+  rounded rect + small filled rounded rect bottom-right, SF
+  `pip.enter`-style), verified centered and legible in a PIL
+  composite of the full bar built from the real layout numbers.
+  It is stop 3 in the toolbar focus order (URL shifts to 4),
+  tooltip "Picture in Picture", D-pad activation wired through
+  `performClick`, and it dims like Back/Forward when no video
+  is present (playing *or* paused counts for the buttons; the
+  Done gate keeps its playing-only rule). Clicking it with no
+  video on the page toasts "Picture in Picture needs a video
+  on the page".
+- **(Part 3) PiP pill on the phone remote.** The nav pill row
+  gains a fourth pill, [Back] [Forward] [Reload] [PiP] (same
+  glyph as an inline SVG + "PiP"), visible in both modes per
+  the unified deck; the row's pills are flex-shared, so four
+  still fit a narrow phone. It sends `{t:"pip"}` →
+  `RemoteServer` → new `Host.remotePip()` → `startPip("phone")`
+  (logged no-op when the browser isn't current).
+
+## v1.33 (Oct 29, 2026) — horizontal trackpad scrolling, 5s cursor fade, in-app picture-in-picture
+
+Three parts from Kurt: two-finger trackpad pans should scroll
+horizontally as well as vertically, the fullscreen cursor should
+fade after 5 idle seconds instead of 10, and leaving the browser
+with a video playing should float it picture-in-picture over the
+menus instead of pausing it.
+
+- **(Part 1) Horizontal scrolling on the phone trackpad.** The
+  two-finger gesture now tracks the touch centroid on both axes,
+  with per-axis fractional accumulators under the same
+  `SCROLL_FACTOR` 0.5 discipline, and sends
+  `{ t: "scroll", dx: <int>, dy: <int> }` (either component may be
+  0; nothing is sent when both are 0). The server accepts the new
+  `dx` alongside `dy` (old dy-only messages still parse), and the
+  TV routes both axes through the existing `doScrollBy(dx, dy)` —
+  the document-extent clamp and the video-bounded scroll area
+  govern horizontal motion exactly as they govern vertical. In
+  the trackpad's menu-navigation context, accumulated two-finger
+  horizontal pans past the same ~48px step threshold emit
+  left/right key steps, mirroring the vertical convention
+  (fingers right = step left, content follows the fingers).
+  One-finger behavior is unchanged.
+- **(Part 2) Cursor idle fade 10s → 5s.** One constant,
+  `CURSOR_FADE_MS = 5000`, now arms the fullscreen /
+  pseudo-fullscreen cursor fade (`pokeFsCursor` was and remains
+  the only arm site). Scope unchanged: normal browsing still
+  never fades, and no other timer was touched.
+- **(Part 3) In-app picture-in-picture.** Fire OS 6 is API 25 —
+  no Activity PiP (26+) — so PiP is the browser pane itself
+  reparented into a floating frame (384×216dp, bottom-right,
+  20dp margins, rounded corners, hairline border, elevation)
+  above the menu screens, chrome hidden, WebView never hidden,
+  paused, or suspended. Trigger: the normal leave-browser path
+  (`closeBrowser` — toolbar Done, phone Done, BACK-out, browser
+  menu Done) finds a video playing (fresh <2s poll;
+  pseudo-fullscreen counts; a real fullscreen session is torn
+  down first, then PiP) and floats the window instead of the
+  legacy Done. No playing video = legacy Done, unchanged. While
+  PiP is up, Home is the current screen (the phone sees the
+  browser as closed), the frame is a focusable "resume" control
+  (CENTER/tap restores full-size, playback uninterrupted), and a
+  ✕ chip at its top-right ends PiP into the legacy Done state.
+  Opening any new link (category/search/favorite/RW tile, phone
+  URL) tears PiP down first and opens the new site full-screen —
+  never inside the small window; the resume bar pointing at the
+  PiP page itself resumes it instead. Logged under HeckYeahFS:
+  `pip enter url=<host>`, `pip exit reason=resume|close|newlink`.
+  PiP is runtime-only; a cold start behaves exactly as before.
 
 ## v1.32 (Oct 29, 2026) — remote text strip + fresh-page URL, 15s pairing card, self-healing cursor
 

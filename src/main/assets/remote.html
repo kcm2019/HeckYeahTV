@@ -128,6 +128,13 @@
   }
   .pill:active { background: rgba(255,255,255,0.22); }
   .pill svg { opacity: 0.9; }
+  /* v1.36: PiP active - the pill is lit accent (like the TV's
+     Phone button when paired) to read as the way BACK to the app.
+     The glyph strokes/fills are currentColor so it tints as one. */
+  .pill.pipOn {
+    color: #0a84ff; background: rgba(10,132,255,0.16);
+    box-shadow: inset 0 0 0 1px rgba(10,132,255,0.55);
+  }
   .bar { display: flex; gap: 8px; }
   .bar input {
     flex: 1 1 auto; min-width: 0; height: 44px;
@@ -188,7 +195,7 @@
   #note { min-height: 17px; font-size: 13px; color: #ffd60a; text-align: center; }
   #panelType #note { text-align: center; }
 
-  /* ------------------------------------------------ PIN sheet */
+  /* ------------------------------------------------ pairing sheet (v1.37: compare-and-pair, no typed code) */
   #overlay {
     position: fixed; inset: 0; background: #000; z-index: 10;
     display: none; align-items: center; justify-content: center;
@@ -198,17 +205,21 @@
   #pairBox { width: min(330px, 88vw); display: flex; flex-direction: column; gap: 14px; text-align: center; }
   #pairBox h1 { font-size: 22px; font-weight: 700; margin: 0; }
   #pairBox p { margin: 0; color: #98989f; font-size: 14px; line-height: 1.45; }
-  #pinInput {
-    background: #1c1c1e; color: #fff; border: 1px solid rgba(255,255,255,0.12); border-radius: 14px;
-    height: 60px; font-size: 30px; font-weight: 600; text-align: center; letter-spacing: 16px;
-    outline: none; font-family: inherit; width: 100%;
+  #pairCode {
+    font-size: 46px; font-weight: 700; letter-spacing: 10px; color: #0a84ff;
+    font-variant-numeric: tabular-nums; line-height: 1.15;
   }
-  #pinInput::placeholder { color: #48484a; }
+  #pairCount { font-size: 13px; color: #98989f; min-height: 16px; }
   #btnPair {
     background: #0a84ff; border: 0; border-radius: 14px; height: 50px;
     font-size: 16.5px; font-weight: 600; width: 100%;
   }
   #btnPair:active { background: #409cff; }
+  #btnPairAlt {
+    background: transparent; border: 1px solid rgba(255,255,255,0.18); border-radius: 14px;
+    height: 46px; font-size: 15px; font-weight: 600; width: 100%; color: #fff;
+  }
+  #btnPairAlt:active { background: rgba(255,255,255,0.12); }
   #pairErr { color: #ff453a; font-size: 13px; min-height: 16px; }
 
   /* -------------------------------------- v1.25 (Part C): short screens
@@ -263,6 +274,7 @@
   <button class="pill" id="btnBack"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15.1 4.6 L8.2 12 L15.1 19.4"/></svg>Back</button>
   <button class="pill" id="btnFwd">Forward<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8.9 4.6 L15.8 12 L8.9 19.4"/></svg></button>
   <button class="pill" id="btnReload"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M16.89 17.82 A7.6 7.6 0 1 1 12.18 4.40" stroke-width="2" stroke-linecap="butt"/><polygon points="15.80,5.42 12.23,2.20 12.13,6.60" fill="#fff" stroke="none"/></svg>Reload</button>
+  <button class="pill" id="btnPip"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="3.5"/><rect x="12.5" y="11.5" width="6" height="4.5" rx="1.2" fill="currentColor" stroke="none"/></svg>PiP</button>
 </div>
 <div id="launchRow">
   <button class="chip" id="chipUrl" aria-label="Open URL bar"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12 L20.5 12 M12 3.5 C14.8 6.2 14.8 17.8 12 20.5 C9.2 17.8 9.2 6.2 12 3.5 Z"/></svg>URL</button>
@@ -304,9 +316,11 @@
 <div id="overlay">
   <div id="pairBox">
     <h1>HeckYeah TV</h1>
-    <p>Enter PIN shown on TV to pair this phone.</p>
-    <input id="pinInput" inputmode="numeric" pattern="[0-9]*" maxlength="4" placeholder="••••" autocomplete="one-time-code">
-    <button id="btnPair">Connect</button>
+    <p id="pairMsg">Requesting a pairing code…</p>
+    <div id="pairCode" class="gone"></div>
+    <div id="pairCount"></div>
+    <button id="btnPair">Pair</button>
+    <button id="btnPairAlt" class="gone">Cancel</button>
     <div id="pairErr"></div>
   </div>
 </div>
@@ -314,11 +328,14 @@
 <script>
 (function () {
   "use strict";
-  // Hold-to-repeat timing for the clickpad direction zones and
-  // the volume rocker, and the trackpad two-finger scroll
-  // sensitivity (1.0 = v1.22 feel).
+  // Hold-to-repeat timing for the volume rocker (phone-side,
+  // unchanged), and the trackpad two-finger scroll sensitivity
+  // (1.0 = v1.22 feel). v1.39: clickpad DIRECTION holds no
+  // longer repeat from this page at all - the phone sends one
+  // {t:"key",h:1} on press and {h:0} on release, and the TV
+  // owns the repeat (the v1.23 phone-side interval stream died
+  // after ~3 steps in the field).
   var REPEAT_DELAY_MS = 400;
-  var REPEAT_INTERVAL_MS = 100;
   var VOL_REPEAT_INTERVAL_MS = 120; // a touch slower: volume steps are coarse
   var SCROLL_FACTOR = 0.5;
   var ws = null;
@@ -326,6 +343,17 @@
   var reconnectTimer = null;
   var reconnectDelay = 800;
   var intentionalClose = false;
+  // v1.38: socket ownership. wsGen increments on every connect();
+  // each socket's handlers capture their own socket object and go
+  // completely inert once it is no longer the current one — a
+  // superseded socket's late error/close used to splash the
+  // pairing overlay over a LIVE connection (the double-pairing
+  // prompt). pairedKnown is the page's session belief: set true
+  // when a socket opens or /pair/session answers 200, false only
+  // on a proven 401 from that endpoint — never from a socket
+  // event alone.
+  var wsGen = 0;
+  var pairedKnown = false;
 
   var dot = document.getElementById("dot");
   var nowTitle = document.getElementById("nowTitle");
@@ -334,8 +362,12 @@
   var urlInput = document.getElementById("urlInput");
   var typeInput = document.getElementById("typeInput");
   var overlay = document.getElementById("overlay");
-  var pinInput = document.getElementById("pinInput");
   var pairErr = document.getElementById("pairErr");
+  var pairMsg = document.getElementById("pairMsg");
+  var pairCodeEl = document.getElementById("pairCode");
+  var pairCountEl = document.getElementById("pairCount");
+  var btnPair = document.getElementById("btnPair");
+  var btnPairAlt = document.getElementById("btnPairAlt");
   var noteTimer = null;
 
   function setConnected(on) {
@@ -380,11 +412,16 @@
   function inMenuNav() { return mode === "trackpad" && lastBrowser === false; }
 
   function applyMode() {
-    stopRepeat(); // a mode switch kills any in-flight hold-repeat
-    // Part F: a real mode switch collapses the URL/Type panels.
-    // (applyMode also runs on plain state pushes - those must not
-    // slam a panel the user just opened.)
-    if (lastAppliedMode !== null && lastAppliedMode !== mode) collapsePanels();
+    // Part F: a real mode switch collapses the URL/Type panels
+    // and kills any in-flight hold-repeat. v1.40: stopRepeat
+    // joins the gate - it used to run unconditionally on
+    // applyMode's first line, and handleState() calls applyMode
+    // on EVERY state push (2.5s heartbeat included), so any
+    // D-pad hold was guillotined by the next push even when the
+    // mode never changed. Genuine switches still stop holds:
+    // the seg buttons and the mode auto-follow both CHANGE the
+    // mode, so lastAppliedMode differs there.
+    if (lastAppliedMode !== null && lastAppliedMode !== mode) { stopRepeat(); collapsePanels(); }
     lastAppliedMode = mode;
     var isPad = mode === "trackpad";
     pad.style.display = isPad ? "block" : "none";
@@ -417,6 +454,9 @@
     nowUrl.textContent = s.url || "";
     document.getElementById("btnBack").disabled = !s.canBack;
     document.getElementById("btnFwd").disabled = !s.canFwd;
+    // v1.36: PiP up (either kind) -> the PiP pill lights as the way back.
+    if (typeof s.pip === "boolean")
+      document.getElementById("btnPip").className = "pill" + (s.pip ? " pipOn" : "");
     if (s.note) showNote(s.note);
     if (typeof s.browser === "boolean") {
       if (lastBrowser !== null && s.browser !== lastBrowser) modeOverride = null;
@@ -428,39 +468,67 @@
     }
   }
 
-  function connect() {
+  // v1.38: connect() is single-flight and generation-scoped.
+  // Without force, a CONNECTING or OPEN socket is left strictly
+  // alone (a leftover reconnect timer must never close a good
+  // socket). force is reserved for the post-pair path in
+  // onPaired(): a socket started BEFORE the session cookie
+  // existed is known-doomed, so it is closed and recreated — now
+  // safe, because the old socket's handlers are inert (below).
+  function connect(force) {
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    if (ws && !force && (ws.readyState === 0 || ws.readyState === 1)) return;
     if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+    var gen = ++wsGen;
     var proto = location.protocol === "https:" ? "wss://" : "ws://";
+    var sock = null;
     try {
-      ws = new WebSocket(proto + location.host + "/ws");
+      sock = new WebSocket(proto + location.host + "/ws");
     } catch (e) {
       scheduleReconnect();
       return;
     }
-    ws.onopen = function () {
+    ws = sock;
+    var sockOpened = false; // did THIS socket ever reach onopen?
+    sock.onopen = function () {
+      if (sock !== ws) return; // superseded: completely inert
+      sockOpened = true;
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
       setConnected(true);
       reconnectDelay = 800;
-      overlay.className = "";
-      pairErr.textContent = "";
+      pairedKnown = true;
+      hidePairingOverlay();
     };
-    ws.onmessage = function (ev) {
+    sock.onmessage = function (ev) {
+      if (sock !== ws) return;
       var msg = null;
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
       if (msg && msg.t === "state") handleState(msg);
     };
-    ws.onclose = function () {
+    sock.onclose = function () {
+      if (sock !== ws) return; // superseded: no state, no timers, no overlay
       stopRepeat(); // never leave a repeat running on a dead socket
       setConnected(false);
       ws = null;
       if (intentionalClose) return;
-      // A refused upgrade (401: not paired, or session dropped)
-      // also lands here; try one quick reconnect, then ask for PIN.
-      scheduleReconnect();
+      if (sockOpened) {
+        // This session WAS valid (the socket opened): a transient
+        // drop. The cookie re-authenticates on reconnect — never
+        // splash pairing over a drop.
+        scheduleReconnect();
+        return;
+      }
+      // Never opened: the upgrade was refused (401 unpaired) OR
+      // the server hiccuped. A close event cannot tell which —
+      // ask the server (checkSessionThenAct) before doing
+      // anything user-visible.
+      checkSessionThenAct(gen);
     };
-    ws.onerror = function () {
-      // The server answers unpaired upgrades with HTTP 401, which
-      // surfaces here as an error followed by close. Show pairing.
-      overlay.className = "show";
+    sock.onerror = function () {
+      if (sock !== ws) return;
+      // Deliberately NO overlay here: an error event carries no
+      // evidence the session is invalid, and browsers always pair
+      // it with a close — onclose decides, with proof.
     };
   }
 
@@ -468,36 +536,260 @@
     if (reconnectTimer) return;
     reconnectTimer = setTimeout(function () {
       reconnectTimer = null;
+      // While the pairing UI is active the reconnect loop is
+      // PAUSED - just re-check later instead of connecting.
+      if (overlay.className === "show") { scheduleReconnect(); return; }
+      // v1.38: re-validate before connecting — if a socket has
+      // since become CONNECTING/OPEN, this stale timer dies
+      // quietly instead of closing it.
+      if (ws && (ws.readyState === 0 || ws.readyState === 1)) return;
       reconnectDelay = Math.min(reconnectDelay * 1.6, 6000);
       connect();
     }, reconnectDelay);
   }
 
-  document.getElementById("btnPair").addEventListener("click", function () {
-    var pin = (pinInput.value || "").trim();
-    if (pin.length !== 4) { pairErr.textContent = "Enter the 4-digit PIN."; return; }
+  // v1.38: the ONLY socket-path route to the pairing overlay.
+  // After a never-opened socket closes, GET /pair/session (the
+  // server checks the hy cookie exactly like the WS upgrade):
+  //   200 -> still paired: reconnect silently (server hiccup).
+  //   401 -> genuinely unpaired (first visit, server restart,
+  //          session dropped): show the pairing overlay.
+  //   network failure -> proves nothing: back off and retry.
+  // The result is acted on only if nothing material changed
+  // while the check was in flight (same socket generation, no
+  // live/connecting socket, overlay not already up).
+  function checkSessionThenAct(genAtClose) {
+    fetch("/pair/session", { method: "GET", credentials: "same-origin" })
+      .then(function (r) { return r.status; })
+      .catch(function () { return 0; })
+      .then(function (status) {
+        if (genAtClose !== wsGen) return; // a newer socket exists
+        if (ws && (ws.readyState === 0 || ws.readyState === 1)) return;
+        if (overlay.className === "show") return;
+        if (status === 200) {
+          pairedKnown = true;
+          scheduleReconnect();
+        } else if (status === 401) {
+          pairedKnown = false;
+          showPairingOverlay();
+        } else {
+          scheduleReconnect();
+        }
+      });
+  }
+
+  // ------------------------------------------------------------ v1.37: compare-and-pair
+  // The phone never types or submits a code. Opening the overlay
+  // starts ONE pairing request (POST /pair/start, once per state
+  // machine run); the server answers with a 6-digit code shown
+  // here AND on the TV. Either side confirms: this page's Pair
+  // button (POST /pair/confirm) or OK on the TV - the 1s status
+  // poll (GET /pair/status) picks up a TV approval, cookie and
+  // all, and connects the WebSocket.
+  var pairPhase = "idle"; // idle|starting|live|error|expired|cancelled
+  var pairReq = null;     // {id, key} of the live request
+  var pairTimer = null;   // 1s countdown + poll interval
+  var pairExpiresAt = 0;  // local deadline, ms epoch (server-corrected on poll)
+  var pairPollBusy = false;
+
+  function pairPost(path, bodyObj, ok, fail) {
+    // v1.38: credentials explicit — the hy Set-Cookie on the
+    // confirm/status responses must be stored/sent unambiguously
+    // by phone browsers.
+    var opts = { method: "POST", headers: { "Content-Type": "application/json" },
+                 credentials: "same-origin" };
+    if (bodyObj) opts.body = JSON.stringify(bodyObj);
+    fetch(path, opts).then(function (r) {
+      return r.json().then(function (j) { return { status: r.status, body: j }; })
+        .catch(function () { return { status: r.status, body: null }; });
+    }).then(function (res) { ok(res.status, res.body); }).catch(fail);
+  }
+
+  function clearPairTimer() {
+    if (pairTimer) { clearInterval(pairTimer); pairTimer = null; }
+  }
+
+  function groupedPairCode(code) {
+    return code && code.length === 6 ? code.slice(0, 3) + " " + code.slice(3) : (code || "");
+  }
+
+  function fmtPairClock(ms) {
+    var s = Math.max(0, Math.ceil(ms / 1000));
+    return Math.floor(s / 60) + ":" + ("0" + (s % 60)).slice(-2);
+  }
+
+  function showPairingOverlay() {
+    var fresh = overlay.className !== "show";
+    overlay.className = "show";
+    if (fresh) startPairing();
+  }
+
+  function hidePairingOverlay() {
+    overlay.className = "";
+    pairPhase = "idle";
+    pairReq = null;
+    clearPairTimer();
     pairErr.textContent = "";
-    fetch("/pair", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pin: pin })
-    }).then(function (r) {
-      return r.json().then(function (j) { return { status: r.status, body: j }; });
-    }).then(function (res) {
-      if (res.status === 200 && res.body && res.body.ok) {
-        overlay.className = "";
-        reconnectDelay = 800;
-        connect();
-      } else if (res.status === 429) {
-        pairErr.textContent = "Too many wrong tries — wait a minute and try again.";
-      } else if (res.status === 403) {
-        pairErr.textContent = "Two phones are already paired. Disconnect one on the TV first.";
-      } else {
-        pairErr.textContent = "Wrong PIN — check the TV and try again.";
+  }
+
+  function pairStartErrorText(status) {
+    if (status === 403) return "Two phones are already paired. Disconnect one on the TV first.";
+    if (status === 409) return "Another phone is pairing — wait for it to finish, then try again.";
+    if (status === 429) return "Too many pairing attempts — wait a minute and try again.";
+    return "Pairing failed — try again.";
+  }
+
+  // Terminal-ish UI states: error / expired / cancelled all park
+  // the machine with the primary button re-armed to start over.
+  function pairPark(phase, msg, errText, btnLabel) {
+    clearPairTimer();
+    pairReq = null;
+    pairPhase = phase;
+    pairCodeEl.className = "gone";
+    pairCountEl.textContent = "";
+    btnPairAlt.className = "gone";
+    pairMsg.textContent = msg;
+    pairErr.textContent = errText || "";
+    btnPair.textContent = btnLabel;
+    btnPair.disabled = false;
+  }
+
+  function startPairing() {
+    if (pairPhase === "starting" || pairPhase === "live") return; // one start per run
+    pairPhase = "starting";
+    pairReq = null;
+    clearPairTimer();
+    pairErr.textContent = "";
+    pairCodeEl.className = "gone";
+    pairCountEl.textContent = "";
+    btnPairAlt.className = "gone";
+    pairMsg.textContent = "Requesting a pairing code…";
+    btnPair.textContent = "Pair";
+    btnPair.disabled = true;
+    pairPost("/pair/start", null, function (status, j) {
+      if (pairPhase === "cancelled") {
+        // Cancelled while the start was in flight: retire the
+        // request server-side too, best-effort.
+        if (status === 200 && j && j.ok) pairPost("/pair/cancel", { id: j.id, key: j.key },
+          function () {}, function () {});
+        return;
       }
-    }).catch(function () {
-      pairErr.textContent = "Could not reach the TV. Same Wi-Fi network?";
+      if (pairPhase !== "starting") return;
+      if (status === 200 && j && j.ok) {
+        pairPhase = "live";
+        pairReq = { id: j.id, key: j.key };
+        pairExpiresAt = Date.now() + (j.expiresIn || 60) * 1000;
+        pairMsg.textContent = "Make sure this code matches the one on your TV.";
+        pairCodeEl.textContent = groupedPairCode(j.code);
+        pairCodeEl.className = "";
+        btnPair.disabled = false;
+        btnPairAlt.className = "";
+        tickPair();
+        pairTimer = setInterval(tickPair, 1000);
+      } else {
+        pairPark("error", "Couldn't get a pairing code.",
+          status === 0 ? "Could not reach the TV. Same Wi-Fi network?" : pairStartErrorText(status),
+          "Get a new code");
+      }
+    }, function () {
+      if (pairPhase !== "starting") return;
+      pairPark("error", "Couldn't get a pairing code.",
+        "Could not reach the TV. Same Wi-Fi network?", "Get a new code");
     });
+  }
+
+  function tickPair() {
+    if (pairPhase !== "live" || !pairReq) return;
+    var left = pairExpiresAt - Date.now();
+    if (left <= 0) {
+      pairPark("expired", "Code expired", "", "Get a new code");
+      return;
+    }
+    pairCountEl.textContent = "Code expires in " + fmtPairClock(left);
+    pollPairStatus();
+  }
+
+  function pollPairStatus() {
+    if (pairPollBusy || !pairReq) return;
+    pairPollBusy = true;
+    var req = pairReq;
+    fetch("/pair/status?id=" + encodeURIComponent(req.id)
+        + "&key=" + encodeURIComponent(req.key),
+        { method: "GET", credentials: "same-origin" })
+      .then(function (r) {
+        return r.json().then(function (j) { return { status: r.status, body: j }; })
+          .catch(function () { return { status: r.status, body: null }; });
+      })
+      .then(function (res) {
+        pairPollBusy = false;
+        if (pairPhase !== "live" || pairReq !== req) return; // superseded / cancelled
+        var j = res.body || {};
+        if (res.status === 200 && j.state === "approved") {
+          onPaired(); // the TV confirmed first; cookie came with the response
+        } else if (j.state === "denied") {
+          pairPark("error", "Pairing declined",
+            "The TV declined this pairing. Get a new code to try again.", "Get a new code");
+        } else if (res.status === 410 || j.state === "expired") {
+          pairPark("expired", "Code expired", "", "Get a new code");
+        } else if (res.status === 200 && j.state === "pending"
+            && typeof j.expiresIn === "number") {
+          pairExpiresAt = Date.now() + j.expiresIn * 1000; // server clock wins
+          pairCountEl.textContent = "Code expires in " + fmtPairClock(j.expiresIn * 1000);
+        }
+      })
+      .catch(function () { pairPollBusy = false; });
+  }
+
+  function onPaired() {
+    // v1.38: exactly ONE new socket results. pairedKnown is set,
+    // every timer that could later close a good socket is dead,
+    // and hidePairingOverlay() drops pairPhase to "idle" — any
+    // in-flight status-poll/confirm callback that lands after
+    // this finds its guards tripped and stays inert. connect
+    // uses the forced post-pair path: a socket started before
+    // the cookie existed is known-doomed.
+    pairedKnown = true;
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    hidePairingOverlay();
+    reconnectDelay = 800;
+    connect(true);
+  }
+
+  btnPair.addEventListener("click", function () {
+    if (pairPhase === "live" && pairReq) {
+      // The phone-side confirm of the dual-confirm flow.
+      btnPair.disabled = true;
+      pairErr.textContent = "";
+      var req = pairReq;
+      pairPost("/pair/confirm", { id: req.id, key: req.key }, function (status, j) {
+        if (pairPhase !== "live" || pairReq !== req) return;
+        if (status === 200 && j && j.ok) { onPaired(); return; }
+        if (status === 410) {
+          pairPark("expired", "Code expired", "", "Get a new code");
+        } else if (status === 403) {
+          pairPark("error", "Couldn't pair",
+            "Two phones are already paired. Disconnect one on the TV first.", "Get a new code");
+        } else {
+          btnPair.disabled = false;
+          pairErr.textContent = "Pairing failed — check the code matches, or get a new code.";
+        }
+      }, function () {
+        if (pairPhase !== "live" || pairReq !== req) return;
+        btnPair.disabled = false;
+        pairErr.textContent = "Could not reach the TV. Same Wi-Fi network?";
+      });
+    } else if (pairPhase === "error" || pairPhase === "expired" || pairPhase === "cancelled") {
+      startPairing(); // primary button re-armed: fresh request
+    }
+  });
+
+  btnPairAlt.addEventListener("click", function () {
+    if (pairPhase !== "live" && pairPhase !== "starting") return;
+    var req = pairReq;
+    pairPhase = "cancelled"; // set first: any in-flight start retires itself
+    if (req) pairPost("/pair/cancel", { id: req.id, key: req.key },
+      function () {}, function () {});
+    pairPark("cancelled", "Pairing cancelled", "", "Try again");
   });
 
   // ------------------------------------------------------------ buttons
@@ -506,6 +798,7 @@
   bind("btnBack", function () { send({ t: "back" }); });
   bind("btnFwd", function () { send({ t: "fwd" }); });
   bind("btnReload", function () { send({ t: "reload" }); });
+  bind("btnPip", function () { send({ t: "pip" }); });
   // v1.25 (Part D): Play/Pause fires on PRESS, not click - a bare
   // click can be swallowed when the page shifts under the finger
   // ("pause doesn't work until I click multiple times"). Same
@@ -667,18 +960,18 @@
     pressFx(k === "ok" ? okBtn : zones[k]);
   }
 
-  // ----- hold-to-repeat. One shared helper drives both the
-  // clickpad direction zones (sending {"t":"key"} messages) and
-  // the volume rocker halves (sending {"t":"vol"} messages):
-  // startRepeat takes a send-thunk, fires it immediately, then
-  // re-fires it every intervalMs once REPEAT_DELAY_MS has passed.
-  // Exactly ONE repeat can be active at a time across both
-  // controls — starting one stops the other. Repeats are
-  // generated here on the phone by sending more of the same
-  // messages; the TV side and the protocol are unchanged. -----
+  // ----- hold-to-repeat. The shared helper below now drives
+  // ONLY the volume rocker halves (sending {"t":"vol"}
+  // messages): startRepeat takes a send-thunk, fires it
+  // immediately, then re-fires it every intervalMs once
+  // REPEAT_DELAY_MS has passed. Clickpad direction holds use
+  // the TV-owned protocol further down (startKeyHold). Exactly
+  // ONE hold of either kind can be active at a time — starting
+  // one stops the other, because stopRepeat() also releases
+  // any key hold (see stopKeyHold). -----
   var repeatSendFn = null;
   var repeatEl = null;   // element that stays .press-lit for the hold
-  var repeatDir = null;  // direction name when the repeat is a clickpad key
+  var repeatDir = null;  // legacy: only volume uses startRepeat now (always null dir)
   var repeatDelayTimer = null;
   var repeatIntervalTimer = null;
 
@@ -707,12 +1000,40 @@
     repeatSendFn = null;
     repeatEl = null;
     repeatDir = null;
+    stopKeyHold(); // v1.39: every stop path also releases a TV key hold
   }
 
+  // ----- v1.39: TV-owned direction holds. Pressing a zone
+  // sends ONE {t:"key",k:dir,h:1}; the TV fires the first step
+  // and repeats it until the matching h:0 arrives. There are
+  // deliberately NO mid-hold kill paths left on this page: the
+  // old touchmove slide-off check and the flick cancel used to
+  // murder real holds (finger micro-drift, press transforms,
+  // SVG children confusing elementFromPoint) - a hold now ends
+  // only on a genuine release path, and every one of those
+  // funnels through stopRepeat() -> stopKeyHold(): touchend,
+  // touchcancel, mouseup, clickpad mouseleave, window blur,
+  // mode switch (applyMode), current-socket close (onclose),
+  // flick recognition, or a new press replacing this one.
   // Direction zones only (never OK: repeated selects would be
-  // destructive).
-  function startKeyRepeat(dir) {
-    startRepeat(function () { sendKey(dir); }, zones[dir], REPEAT_INTERVAL_MS, dir);
+  // destructive). -----
+  var keyHoldDir = null;
+  var keyHoldEl = null;
+
+  function startKeyHold(dir) {
+    stopRepeat(); // releases any prior key hold + any volume repeat
+    keyHoldDir = dir;
+    keyHoldEl = zones[dir] || null;
+    if (keyHoldEl) keyHoldEl.classList.add("press"); // lit for the whole hold
+    send({ t: "key", k: dir, h: 1 });
+  }
+
+  function stopKeyHold() {
+    if (keyHoldEl) { keyHoldEl.classList.remove("press"); keyHoldEl = null; }
+    if (!keyHoldDir) return;
+    var dir = keyHoldDir;
+    keyHoldDir = null;
+    send({ t: "key", k: dir, h: 0 });
   }
 
   function startVolRepeat(d, el) {
@@ -734,13 +1055,13 @@
     cpTarget = cpHit(ev.target);
     cpSwipeFired = false; cpActive = true;
     cpPressFired = false;
-    // A direction zone fires on press-down and arms hold-to-repeat
+    // A direction zone starts a TV-owned hold on press-down
     // (a second finger on another zone replaces it via
-    // startKeyRepeat). OK deliberately does not: it still fires
+    // startKeyHold). OK deliberately does not: it still fires
     // exactly once, on release, in cpEnd.
     if (cpTarget && cpTarget !== "ok") {
       cpPressFired = true;
-      startKeyRepeat(cpTarget);
+      startKeyHold(cpTarget);
     }
   }, { passive: false });
 
@@ -748,28 +1069,34 @@
     ev.preventDefault();
     if (!cpActive) return;
     var t = ev.changedTouches[0];
-    // Sliding off the pressed zone stops its repeat.
-    if (repeatDir) {
-      var under = document.elementFromPoint
-        ? document.elementFromPoint(t.clientX, t.clientY) : null;
-      if (cpHit(under) !== repeatDir) stopRepeat();
-    }
+    // v1.39: NO slide-off check here anymore. It killed real
+    // direction holds mid-press (see startKeyHold) - a hold is
+    // a hold until the finger actually lifts.
+    // v1.40: a press-fired direction touch is a HOLD, full stop:
+    // movement does nothing at all. The flick check below used
+    // to run for these touches too and called stopRepeat() ->
+    // stopKeyHold() (h:0) at >=44px of drift - a thumb settling
+    // into a hold drifts ~44px (~7mm) in ~0.3-0.6s, presenting
+    // on device as "initial step + repeats at 350/460ms = three
+    // steps, then dies", the same count since v1.23. A flick
+    // that starts on a zone releases before the TV's first
+    // repeat (350ms), so it naturally yields exactly one step;
+    // distance travelled while the finger is DOWN cannot
+    // distinguish flick from hold.
+    if (cpPressFired) return;
     if (cpSwipeFired) return;
     var dx = t.clientX - cpStartX, dy = t.clientY - cpStartY;
     if (Math.max(Math.abs(dx), Math.abs(dy)) < 44) return;
-    // A decisive flick anywhere on the surface = that direction,
-    // like flicking across the real Apple TV clickpad. Recognizing
-    // a flick cancels the hold outright, so a finger that lingers
-    // after flicking never starts repeating.
+    // Only non-press-fired touches reach here (v1.40 above):
+    // a decisive flick that began off a zone (OK, gaps between
+    // zones) = that direction, like flicking across the real
+    // Apple TV clickpad, and it fires exactly one key, here.
+    // Recognizing a flick also ends any in-flight repeat
+    // (stopRepeat -> stopKeyHold sends h:0), so a finger that
+    // lingers after flicking never starts repeating on the TV.
     cpSwipeFired = true;
     stopRepeat();
-    // If this touch began on a direction zone, that zone's key
-    // already fired on press-down — the flick must not add a
-    // second one. A flick that began off a zone (OK, gaps between
-    // zones) fires exactly one key, here.
-    if (!cpPressFired) {
-      cpSend(Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? "right" : "left") : (dy > 0 ? "down" : "up"));
-    }
+    cpSend(Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? "right" : "left") : (dy > 0 ? "down" : "up"));
   }, { passive: false });
 
   function cpEnd(ev) {
@@ -785,23 +1112,23 @@
   clickpad.addEventListener("touchcancel", cpEnd, { passive: false });
 
   // Mouse fallback for the clickpad (desktop testing): direction
-  // zones fire on mousedown and hold-repeat just like touch; the
+  // zones start a TV-owned hold on mousedown just like touch; the
   // trailing click is then suppressed, because mousedown already
-  // delivered the key.
+  // delivered the key. v1.39: sliding off a zone no longer kills
+  // a mouse hold either (the per-zone mouseleave handler is
+  // gone) - mouseup, clickpad mouseleave and window blur remain
+  // the release paths, all via stopRepeat() -> stopKeyHold().
   clickpad.addEventListener("mousedown", function (ev) {
     var hit = cpHit(ev.target);
     if (hit && hit !== "ok") {
       lastMouseDown = Date.now();
-      startKeyRepeat(hit);
+      startKeyHold(hit);
     }
   });
   document.addEventListener("mouseup", function () { stopRepeat(); });
   clickpad.addEventListener("mouseleave", function () { stopRepeat(); });
   window.addEventListener("blur", function () { stopRepeat(); });
   Object.keys(zones).forEach(function (k) {
-    zones[k].addEventListener("mouseleave", function () {
-      if (repeatDir === k) stopRepeat(); // slid off the zone
-    });
     zones[k].addEventListener("click", function () {
       if (Date.now() - lastTouchEnd < 700) return; // touch already handled it
       if (Date.now() - lastMouseDown < 700) return; // mousedown already handled it
@@ -859,19 +1186,40 @@
   var touches = {};        // identifier -> {x, y}
   var touchCount = 0;
   var lastX = 0, lastY = 0;   // single-finger tracking
-  var lastMidY = 0;           // two-finger midpoint
+  var lastMidX = 0, lastMidY = 0; // two-finger centroid
   var downAt = 0;
   var moved = 0;
   var longTimer = null;
   var longFired = false;
-  var scrollAccum = 0;
+  var scrollAccum = 0;        // vertical two-finger scroll accumulator
+  var scrollAccumX = 0;       // v1.33: horizontal twin of scrollAccum
   // v1.25 (Part B): menu-navigation step accumulators. In menu
   // context a drag is converted into discrete D-pad steps: every
   // NAV_STEP px of accumulated travel along the dominant axis
   // fires one {"t":"key"} step and is subtracted, so a long drag
   // walks several tiles and a short flick fires exactly one.
   var NAV_STEP = 48;
-  var navAccX = 0, navAccY = 0, navScrollAcc = 0;
+  var navAccX = 0, navAccY = 0, navScrollAcc = 0, navScrollAccX = 0;
+
+  // v1.39: touch-engagement heartbeat for TV edge-push
+  // scrolling. A finger held STILL against the screen edge
+  // sends no touchmove events, so the TV cannot tell "still
+  // holding" from "gone" - v1.35's push died 120ms after the
+  // last move and the scroll arrived as a few jumps. Now the
+  // first trackpad touch sends {t:"touch",d:1}, re-sends it
+  // every 200ms while >=1 finger stays down, and the final
+  // lift sends {t:"touch",d:0}. Purely additive: move/scroll
+  // sending below is untouched.
+  var touchBeatTimer = null;
+  function touchBeatStart() {
+    send({ t: "touch", d: 1 });
+    if (touchBeatTimer) return;
+    touchBeatTimer = setInterval(function () { send({ t: "touch", d: 1 }); }, 200);
+  }
+  function touchBeatStop() {
+    if (touchBeatTimer) { clearInterval(touchBeatTimer); touchBeatTimer = null; }
+    send({ t: "touch", d: 0 });
+  }
 
   function fireNavSteps() {
     for (;;) {
@@ -897,11 +1245,13 @@
 
   pad.addEventListener("touchstart", function (ev) {
     ev.preventDefault();
+    var wasDown = touchCount;
     for (var i = 0; i < ev.changedTouches.length; i++) {
       var t = ev.changedTouches[i];
       touches[t.identifier] = pos(t);
       touchCount++;
     }
+    if (wasDown === 0 && touchCount > 0) touchBeatStart(); // v1.39
     if (touchCount === 1) {
       var p0 = pos(ev.changedTouches[0]);
       lastX = p0.x; lastY = p0.y;
@@ -920,9 +1270,12 @@
     } else if (touchCount === 2) {
       cancelLong();
       var pts = Object.keys(touches).map(function (k) { return touches[k]; });
+      lastMidX = (pts[0].x + pts[1].x) / 2;
       lastMidY = (pts[0].y + pts[1].y) / 2;
       scrollAccum = 0;
+      scrollAccumX = 0;
       navScrollAcc = 0;
+      navScrollAccX = 0;
     }
   }, { passive: false });
 
@@ -952,8 +1305,11 @@
     } else if (touchCount === 2) {
       var pts = Object.keys(touches).map(function (k) { return touches[k]; });
       if (pts.length === 2) {
+        var midX = (pts[0].x + pts[1].x) / 2;
         var midY = (pts[0].y + pts[1].y) / 2;
+        var sdx = midX - lastMidX;
         var sdy = midY - lastMidY;
+        lastMidX = midX;
         lastMidY = midY;
         if (inMenuNav()) {
           // Part B: two-finger scroll becomes up/down steps with
@@ -965,22 +1321,39 @@
             sendKey(navScrollAcc > 0 ? "up" : "down");
             navScrollAcc -= (navScrollAcc > 0 ? 1 : -1) * NAV_STEP;
           }
+          // v1.33: the horizontal pan mirrors it - fingers moving
+          // right step LEFT (content follows the fingers, so you
+          // see what was off-screen left), and vice versa.
+          navScrollAccX += sdx;
+          while (Math.abs(navScrollAccX) >= NAV_STEP) {
+            sendKey(navScrollAccX > 0 ? "left" : "right");
+            navScrollAccX -= (navScrollAccX > 0 ? 1 : -1) * NAV_STEP;
+          }
           return;
         }
-        // SCROLL_FACTOR scales the finger delta into a fractional
-        // accumulator, so slow small drags build up smoothly
-        // instead of being truncated away event by event.
+        // SCROLL_FACTOR scales the finger delta into fractional
+        // accumulators (one per axis, v1.33), so slow small drags
+        // build up smoothly instead of being truncated away event
+        // by event.
         scrollAccum += sdy * SCROLL_FACTOR;
-        if (Math.abs(scrollAccum) >= 2) {
-          // Finger drags down = page follows finger (scroll up content):
-          // send the negated delta, matching touch-scroll convention,
-          // in whole units only; the fractional remainder (converted
+        scrollAccumX += sdx * SCROLL_FACTOR;
+        if (Math.abs(scrollAccum) >= 2 || Math.abs(scrollAccumX) >= 2) {
+          // Finger drags = page follows finger: send the negated
+          // deltas, matching touch-scroll convention, in whole
+          // units only; each axis's fractional remainder (converted
           // back into accumulator units) carries to the next move.
-          var scaledOut = -scrollAccum * 3;
-          var wholeOut = scaledOut < 0 ? Math.ceil(scaledOut) : Math.floor(scaledOut);
-          if (wholeOut !== 0) {
-            send({ t: "scroll", dy: wholeOut });
-            scrollAccum = -(scaledOut - wholeOut) / 3;
+          // Final message shape: { t: "scroll", dx: <int>, dy: <int> }
+          // - either component may be 0; the TV routes both through
+          // doScrollBy. A message is sent only when at least one
+          // component is nonzero.
+          var scaledY = -scrollAccum * 3;
+          var wholeY = scaledY < 0 ? Math.ceil(scaledY) : Math.floor(scaledY);
+          var scaledX = -scrollAccumX * 3;
+          var wholeX = scaledX < 0 ? Math.ceil(scaledX) : Math.floor(scaledX);
+          if (wholeX !== 0 || wholeY !== 0) {
+            send({ t: "scroll", dx: wholeX, dy: wholeY });
+            scrollAccum = -(scaledY - wholeY) / 3;
+            scrollAccumX = -(scaledX - wholeX) / 3;
           }
         }
       }
@@ -1002,7 +1375,8 @@
       }
     }
     touchCount = Math.max(0, touchCount - ended);
-    if (touchCount < 2) { scrollAccum = 0; navScrollAcc = 0; }
+    if (touchCount === 0) touchBeatStop(); // v1.39: last finger lifted
+    if (touchCount < 2) { scrollAccum = 0; scrollAccumX = 0; navScrollAcc = 0; navScrollAccX = 0; }
     if (touchCount === 1) {
       // Re-anchor single-finger tracking after a two-finger gesture.
       var keys = Object.keys(touches);

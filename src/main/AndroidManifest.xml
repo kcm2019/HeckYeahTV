@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.heckyeah.tv"
-    android:versionCode="33"
-    android:versionName="1.32">
+    android:versionCode="41"
+    android:versionName="1.40">
 
     <uses-sdk android:minSdkVersion="25" android:targetSdkVersion="25" />
 
@@ -10,6 +10,8 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <!-- v1.36: brings our task forward to expand the native PiP window on the phone remote's command (normal permission, auto-granted). -->
+    <uses-permission android:name="android.permission.REORDER_TASKS" />
 
     <uses-feature android:name="android.software.leanback" android:required="false" />
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
@@ -31,7 +33,8 @@
             android:exported="true"
             android:hardwareAccelerated="true"
             android:screenOrientation="landscape"
-            android:configChanges="keyboardHidden|orientation|screenSize">
+            android:supportsPictureInPicture="true"
+            android:configChanges="keyboardHidden|orientation|screenSize|smallestScreenSize|screenLayout">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

@@ -37,8 +37,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * v1.19: Phone Remote server. A hand-rolled HTTP + WebSocket
  * (RFC 6455) server on the LAN port 18765: serves the phone page
- * (assets/remote.html), pairs phones with a PIN (max 2 sessions),
- * and forwards control commands to the activity through Host.
+ * (assets/remote.html), pairs phones (max 2 sessions), and
+ * forwards control commands to the activity through Host.
  * Framework APIs only, no dependencies.
  *
  * Threading: 1 accept thread + a bounded pool of connection
@@ -48,18 +48,33 @@ import java.util.concurrent.atomic.AtomicInteger;
  * on a server thread. Everything is exception-guarded: this
  * server must never be able to crash the app.
  *
- * Security model: LAN-only convenience, OFF by default. The PIN
- * is regenerated at every server start, 5 failed pair attempts
- * lock pairing for 60s, and session tokens live in memory only
- * (an app restart or server restart invalidates every phone).
+ * Security model (v1.37, compare-and-pair): LAN-only
+ * convenience, OFF by default. There is no typed PIN and no
+ * code-guessing surface: pairing starts on the phone
+ * (POST /pair/start), which creates ONE pending request with a
+ * one-time random 6-digit code shown on BOTH the phone and the
+ * TV; the request expires in 60s and only one may be pending at
+ * a time. Either side confirms - the phone's Pair tap
+ * (POST /pair/confirm, bound to the request id + a per-request
+ * client key that only the starting phone ever receives) or
+ * the TV's local Pair action - and approval mints the session
+ * token. The phone never submits the code, so there is nothing
+ * to brute-force; abuse control is a per-source-IP throttle on
+ * /pair/start (more than 5 starts within 60s blocks that IP
+ * for 60s). Session tokens live in memory only (an app restart
+ * or server restart invalidates every phone).
  */
 public class RemoteServer {
 
     public static final int PORT = 18765;
     private static final int MAX_SESSIONS = 2;
     private static final int MAX_CONN_THREADS = 6;
-    private static final int MAX_PAIR_FAILS = 5;
-    private static final long PAIR_LOCK_MS = 60000;
+    // v1.37: compare-and-pair constants.
+    private static final long PAIR_REQ_TTL_MS = 60000;      // pending request lifetime
+    private static final long PAIR_REC_KEEP_MS = 60000;     // finished requests stay queryable this long
+    private static final int PAIR_START_LIMIT = 5;          // starts per IP per window
+    private static final long PAIR_START_WINDOW_MS = 60000;
+    private static final long PAIR_START_BLOCK_MS = 60000;
     private static final String WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     private static final float MOVE_GAIN = 1.6f; // trackpad feel
 
@@ -68,20 +83,31 @@ public class RemoteServer {
         void remoteMove(float dx, float dy);
         void remoteTap();
         void remoteLongTap();
-        void remoteScroll(int dyPx);
+        void remoteScroll(int dxPx, int dyPx);
         void remoteBack();
         void remoteForward();
         void remoteReload();
         void remoteDone();
         void remotePlayPause();
+        /** v1.34: the phone remote's PiP pill. */
+        void remotePip();
         void remoteUrl(String u);
         void remoteType(String text);
         void remoteEnterKey();
         /** v1.22: D-pad mode key: up|down|left|right|ok|back|menu. */
         void remoteKey(String k);
+        /** v1.39: D-pad direction hold: h:1 = hold start, h:0 = release.
+         *  The TV owns the repeat; the phone sends no repeat stream. */
+        void remoteKeyHold(String k, boolean down);
+        /** v1.39: trackpad touch engagement (d:1 down / heartbeat,
+         *  d:0 all fingers up) - keeps edge-push scrolling alive
+         *  while a finger is held still against an edge. */
+        void remoteTouch(boolean down);
         void remoteVolume(int dir);
         void remoteSeek(int seconds);
         void remoteSessionsChanged();
+        /** v1.37: pairing state changed (request started / approved / denied / expired / reset). */
+        void remotePairingChanged();
     }
 
     private final Context ctx;
@@ -94,13 +120,46 @@ public class RemoteServer {
     private Thread acceptThread;
     private final AtomicInteger connThreads = new AtomicInteger(0);
 
-    private volatile String pin = "";
     private final Set<String> sessions =
             Collections.synchronizedSet(new HashSet<String>());
     private final List<WsConn> wsClients =
             Collections.synchronizedList(new ArrayList<WsConn>());
-    private int pairFails = 0;
-    private long pairLockUntil = 0;
+
+    // ------------------------------------------------ v1.37: pairing state
+    // ALL pairing state transitions (start, phone confirm, TV
+    // approve, deny, cancel, expiry, reset) are guarded by this
+    // one lock, so interleavings across connection threads can
+    // never mint two sessions for one request or approve a
+    // request that already expired/was denied.
+    private final Object pairLock = new Object();
+
+    /** The single in-flight pairing request (null when none). */
+    private static final class PairReq {
+        String id;       // UUID, public handle of the request
+        String key;      // UUID, secret: returned ONLY to the starting phone
+        String code;     // 6-digit compare code shown on phone + TV
+        String ip;       // source IP that started the request
+        long expiresAt;  // start + PAIR_REQ_TTL_MS
+    }
+
+    /** A finished request, kept briefly so /pair/status can still
+     *  report (and, for approvals, re-deliver) the outcome. */
+    private static final class PairRec {
+        static final int APPROVED = 1, DENIED = 2, EXPIRED = 3;
+        String key;
+        int state;
+        String token;    // APPROVED only
+        long until;      // record dropped after this
+    }
+
+    private PairReq pending; // guarded by pairLock
+    private final java.util.HashMap<String, PairRec> pairRecent =
+            new java.util.HashMap<>(); // guarded by pairLock
+    // Per-source-IP /pair/start throttle, guarded by pairLock.
+    private final java.util.HashMap<String, java.util.ArrayList<Long>> pairStartTimes =
+            new java.util.HashMap<>();
+    private final java.util.HashMap<String, Long> pairStartBlockedUntil =
+            new java.util.HashMap<>();
 
     private NsdManager nsdManager;
     private NsdManager.RegistrationListener nsdListener;
@@ -117,9 +176,12 @@ public class RemoteServer {
 
     public synchronized void start() {
         if (running) return;
-        pin = String.format("%04d", random.nextInt(10000));
-        pairFails = 0;
-        pairLockUntil = 0;
+        synchronized (pairLock) { // v1.37: fresh pairing state per server start
+            pending = null;
+            pairRecent.clear();
+            pairStartTimes.clear();
+            pairStartBlockedUntil.clear();
+        }
         try {
             serverSocket = new ServerSocket(PORT);
         } catch (Exception e) {
@@ -145,19 +207,88 @@ public class RemoteServer {
             wsClients.clear();
         }
         sessions.clear();
+        synchronized (pairLock) { // v1.37: stop() cancels any pending request
+            pending = null;
+            pairRecent.clear();
+        }
         Log.d("HeckYeahFS", "remote server stop");
     }
 
     public boolean isRunning() { return running; }
-    public String pin() { return pin; }
     public int sessionCount() { return sessions.size(); }
 
-    /** New PIN button: fresh PIN, every paired phone dropped. */
-    public void regeneratePinAndDropSessions() {
-        pin = String.format("%04d", random.nextInt(10000));
-        pairFails = 0;
-        pairLockUntil = 0;
-        dropAllSessions();
+    // ------------------------------------------------ v1.37: TV-side pairing API
+
+    /**
+     * The pending request's 6-digit compare code, or null when
+     * there is no live pending request. Lazily expires the
+     * request (expiry is a state transition like any other and
+     * notifies the Host when it happens).
+     */
+    public String pendingPairCode() {
+        boolean changed;
+        String code;
+        synchronized (pairLock) {
+            changed = expirePendingLocked(System.currentTimeMillis());
+            code = pending != null ? pending.code : null;
+        }
+        if (changed) notifyPairingChanged();
+        return code;
+    }
+
+    /** Milliseconds until the pending request expires (0 when none). */
+    public long pendingPairExpiresInMs() {
+        boolean changed;
+        long left;
+        synchronized (pairLock) {
+            long now = System.currentTimeMillis();
+            changed = expirePendingLocked(now);
+            left = pending != null ? Math.max(0, pending.expiresAt - now) : 0;
+        }
+        if (changed) notifyPairingChanged();
+        return left;
+    }
+
+    /** TV Pair action: approve the pending request locally. The
+     *  session token waits for the phone's next /pair/status poll. */
+    public boolean approvePendingFromTv() {
+        String token;
+        synchronized (pairLock) {
+            expirePendingLocked(System.currentTimeMillis());
+            if (pending == null) return false;
+            if (sessions.size() >= MAX_SESSIONS) return false;
+            token = approveLocked(pending);
+        }
+        Log.d("HeckYeahFS", "remote paired via=tv n=" + sessions.size());
+        notifySessionsChanged();
+        notifyPairingChanged();
+        return token != null;
+    }
+
+    /** TV Deny action: reject the pending request. */
+    public boolean denyPendingFromTv() {
+        boolean denied;
+        synchronized (pairLock) {
+            expirePendingLocked(System.currentTimeMillis());
+            denied = pending != null && finishPendingLocked(PairRec.DENIED, null);
+        }
+        if (denied) {
+            Log.d("HeckYeahFS", "remote pairing denied via=tv");
+            notifyPairingChanged();
+        }
+        return denied;
+    }
+
+    /** Panel "Reset pairing": drop every session, cancel any
+     *  pending request, and clear the start throttle. */
+    public void resetPairingAndDropSessions() {
+        synchronized (pairLock) {
+            if (pending != null) finishPendingLocked(PairRec.DENIED, null);
+            pairStartTimes.clear();
+            pairStartBlockedUntil.clear();
+        }
+        dropAllSessions(); // notifies sessions-changed itself
+        notifyPairingChanged();
     }
 
     public void dropAllSessions() {
@@ -173,6 +304,61 @@ public class RemoteServer {
         ui.post(() -> {
             try { host.remoteSessionsChanged(); } catch (Exception ignored) {}
         });
+    }
+
+    private void notifyPairingChanged() {
+        ui.post(() -> {
+            try { host.remotePairingChanged(); } catch (Exception ignored) {}
+        });
+    }
+
+    // ------------------------------------------------ v1.37: pairing core
+    // Every method in this block runs with pairLock held.
+
+    /** Lazy expiry: a pending request past its TTL becomes an
+     *  EXPIRED record. Returns true when a transition happened. */
+    private boolean expirePendingLocked(long now) {
+        if (pending != null && now >= pending.expiresAt) {
+            finishPendingLocked(PairRec.EXPIRED, null);
+            return true;
+        }
+        return false;
+    }
+
+    /** Move the pending request into the recent-records map with
+     *  the given outcome. Returns false when nothing is pending. */
+    private boolean finishPendingLocked(int state, String token) {
+        if (pending == null) return false;
+        PairRec rec = new PairRec();
+        rec.key = pending.key;
+        rec.state = state;
+        rec.token = token;
+        rec.until = System.currentTimeMillis() + PAIR_REC_KEEP_MS;
+        pairRecent.put(pending.id, rec);
+        pending = null;
+        return true;
+    }
+
+    /** The one approval path, shared by phone confirm and TV
+     *  approve: mint the token, add the session, retire the
+     *  request as APPROVED (token stored for status re-delivery,
+     *  so a lost confirm response can't strand the phone, and a
+     *  double approval returns the SAME token - never two
+     *  sessions for one request). Caller checks the slot first. */
+    private String approveLocked(PairReq req) {
+        String token = UUID.randomUUID().toString();
+        sessions.add(token);
+        if (req == pending) finishPendingLocked(PairRec.APPROVED, token);
+        return token;
+    }
+
+    /** Drop finished records past their keep window. */
+    private void pruneRecentLocked(long now) {
+        java.util.Iterator<java.util.Map.Entry<String, PairRec>> it =
+                pairRecent.entrySet().iterator();
+        while (it.hasNext()) {
+            if (now >= it.next().getValue().until) it.remove();
+        }
     }
 
     /** Sends a state JSON text frame to every connected phone. */
@@ -294,8 +480,13 @@ public class RemoteServer {
         if (requestLine.length < 2) return;
         String method = requestLine[0];
         String path = requestLine[1];
+        String query = "";
         int qi = path.indexOf('?');
-        if (qi >= 0) path = path.substring(0, qi);
+        if (qi >= 0) { query = path.substring(qi + 1); path = path.substring(0, qi); }
+        String clientIp = "";
+        try {
+            if (s.getInetAddress() != null) clientIp = s.getInetAddress().getHostAddress();
+        } catch (Exception ignored) {}
         TreeMap<String, String> headers = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
         for (int i = 1; i < lines.length; i++) {
             int c = lines[i].indexOf(':');
@@ -312,49 +503,241 @@ public class RemoteServer {
             writeResponse(out, 200, "OK", "text/html; charset=utf-8", body, null);
             return;
         }
-        if ("POST".equals(method) && "/pair".equals(path)) {
+        if ("POST".equals(method) && path.startsWith("/pair/")) {
             int len = 0;
             try { len = Integer.parseInt(headers.getOrDefault("Content-Length", "0")); }
             catch (Exception ignored) {}
             byte[] body = readFully(in, Math.min(Math.max(len, 0), 4096));
-            handlePair(out, body);
+            if ("/pair/start".equals(path)) { handlePairStart(out, clientIp); return; }
+            if ("/pair/confirm".equals(path)) { handlePairConfirm(out, body); return; }
+            if ("/pair/cancel".equals(path)) { handlePairCancel(out, body); return; }
+        }
+        if ("GET".equals(method) && "/pair/status".equals(path)) {
+            handlePairStatus(out, query);
+            return;
+        }
+        if ("GET".equals(method) && "/pair/session".equals(path)) {
+            handlePairSession(out, headers);
             return;
         }
         writeResponse(out, 404, "Not Found", "text/plain", "not found".getBytes(StandardCharsets.UTF_8), null);
     }
 
-    private void handlePair(OutputStream out, byte[] body) throws Exception {
+    // ------------------------------------------------ v1.37: pairing endpoints
+
+    private static String sessionCookie(String token) {
+        return "Set-Cookie: hy=" + token + "; Path=/; Max-Age=31536000\r\n";
+    }
+
+    /** POST /pair/start: create the single pending request. The
+     *  response carries the code AND the secret client key to the
+     *  starting phone only; the TV learns the code through
+     *  pendingPairCode() (local), never over the wire. */
+    private void handlePairStart(OutputStream out, String ip) throws Exception {
         long now = System.currentTimeMillis();
-        if (now < pairLockUntil) {
-            writeJson(out, 429, "{\"ok\":false,\"err\":\"locked\"}", null);
+        String id, code, key;
+        int err = 0;
+        String errName = "";
+        synchronized (pairLock) {
+            // Per-IP throttle: >5 starts within 60s blocks the IP
+            // for 60s. Attempts are counted before any other check.
+            Long blocked = pairStartBlockedUntil.get(ip);
+            if (blocked != null && now < blocked) {
+                err = 429; errName = "locked";
+            } else {
+                java.util.ArrayList<Long> times = pairStartTimes.get(ip);
+                if (times == null) {
+                    times = new java.util.ArrayList<>();
+                    pairStartTimes.put(ip, times);
+                }
+                times.add(now);
+                while (!times.isEmpty() && now - times.get(0) > PAIR_START_WINDOW_MS)
+                    times.remove(0);
+                if (times.size() > PAIR_START_LIMIT) {
+                    pairStartBlockedUntil.put(ip, now + PAIR_START_BLOCK_MS);
+                    times.clear();
+                    Log.d("HeckYeahFS", "remote pairing locked 60s ip=" + ip);
+                    err = 429; errName = "locked";
+                }
+            }
+            if (err == 0) {
+                expirePendingLocked(now);
+                pruneRecentLocked(now);
+                if (sessions.size() >= MAX_SESSIONS) { err = 403; errName = "full"; }
+                else if (pending != null) { err = 409; errName = "busy"; }
+            }
+            if (err == 0) {
+                PairReq req = new PairReq();
+                req.id = UUID.randomUUID().toString();
+                req.key = UUID.randomUUID().toString();
+                req.code = String.format("%06d", random.nextInt(1000000));
+                req.ip = ip;
+                req.expiresAt = now + PAIR_REQ_TTL_MS;
+                pending = req;
+                id = req.id; code = req.code; key = req.key;
+            } else {
+                id = code = key = null;
+            }
+        }
+        if (err != 0) {
+            writeJson(out, err, "{\"ok\":false,\"err\":\"" + errName + "\"}", null);
             return;
         }
-        String given = "";
+        Log.d("HeckYeahFS", "remote pairing started ip=" + ip);
+        writeJson(out, 200, "{\"ok\":true,\"id\":\"" + id + "\",\"code\":\"" + code
+                + "\",\"key\":\"" + key + "\",\"expiresIn\":"
+                + (PAIR_REQ_TTL_MS / 1000) + "}", null);
+        notifyPairingChanged();
+    }
+
+    /** Query params of /pair/status: id + key, both plain UUIDs. */
+    private static String queryParam(String query, String name) {
+        for (String part : query.split("&")) {
+            int eq = part.indexOf('=');
+            if (eq > 0 && part.substring(0, eq).equals(name))
+                return part.substring(eq + 1);
+        }
+        return "";
+    }
+
+    /** GET /pair/session (v1.38): is the caller's hy cookie a
+     *  live session? Parses the cookie exactly like the WS
+     *  upgrade. 200 {"ok":true,"paired":true} when it is, 401
+     *  otherwise. Read-only: the phone page asks this after a
+     *  WebSocket dies before opening, so a transient socket
+     *  failure is never mistaken for "unpaired" (the v1.38
+     *  double-pairing fix) — the overlay may only appear on a
+     *  proven 401 from here. */
+    private void handlePairSession(OutputStream out,
+                                   TreeMap<String, String> headers) throws Exception {
+        String cookie = headers.getOrDefault("Cookie", "");
+        String token = null;
+        for (String part : cookie.split(";")) {
+            String p = part.trim();
+            if (p.startsWith("hy=")) token = p.substring(3).trim();
+        }
+        if (token != null && sessions.contains(token)) {
+            writeJson(out, 200, "{\"ok\":true,\"paired\":true}", null);
+        } else {
+            writeJson(out, 401, "{\"ok\":false}", null);
+        }
+    }
+
+    /** GET /pair/status?id&key: the phone's poll. A TV approval
+     *  reaches the phone here (with the session cookie). */
+    private void handlePairStatus(OutputStream out, String query) throws Exception {
+        String id = queryParam(query, "id");
+        String key = queryParam(query, "key");
+        long now = System.currentTimeMillis();
+        int status;
+        String json;
+        String cookie = null;
+        boolean changed;
+        synchronized (pairLock) {
+            changed = expirePendingLocked(now);
+            pruneRecentLocked(now);
+            if (pending != null && pending.id.equals(id)) {
+                if (!pending.key.equals(key)) {
+                    status = 401; json = "{\"ok\":false,\"err\":\"key\"}";
+                } else {
+                    long left = Math.max(0, (pending.expiresAt - now + 999) / 1000);
+                    status = 200;
+                    json = "{\"ok\":true,\"state\":\"pending\",\"expiresIn\":" + left + "}";
+                }
+            } else {
+                PairRec rec = pairRecent.get(id);
+                if (rec == null || !rec.key.equals(key)) {
+                    status = 401; json = "{\"ok\":false,\"err\":\"key\"}";
+                } else if (rec.state == PairRec.APPROVED) {
+                    status = 200;
+                    json = "{\"ok\":true,\"state\":\"approved\"}";
+                    cookie = sessionCookie(rec.token);
+                } else if (rec.state == PairRec.DENIED) {
+                    status = 200;
+                    json = "{\"ok\":true,\"state\":\"denied\"}";
+                } else {
+                    status = 410;
+                    json = "{\"ok\":false,\"state\":\"expired\",\"err\":\"expired\"}";
+                }
+            }
+        }
+        if (changed) notifyPairingChanged();
+        writeJson(out, status, json, cookie);
+    }
+
+    /** Parse a {id,key} JSON body; returns [id, key] ("" when absent). */
+    private static String[] pairBodyIds(byte[] body) {
+        String id = "", key = "";
         try {
             JSONObject o = new JSONObject(new String(body, StandardCharsets.UTF_8));
-            given = o.optString("pin", "");
+            id = o.optString("id", "");
+            key = o.optString("key", "");
         } catch (Exception ignored) {}
-        if (!given.isEmpty() && given.equals(pin)) {
-            if (sessions.size() >= MAX_SESSIONS) {
-                writeJson(out, 403, "{\"ok\":false,\"err\":\"full\"}", null);
-                return;
+        return new String[]{id, key};
+    }
+
+    /** POST /pair/confirm {id,key}: the phone's Pair tap.
+     *  Idempotent: re-confirming an approved request re-delivers
+     *  the same token instead of minting a second session. */
+    private void handlePairConfirm(OutputStream out, byte[] body) throws Exception {
+        String[] ids = pairBodyIds(body);
+        String id = ids[0], key = ids[1];
+        long now = System.currentTimeMillis();
+        int status;
+        String json;
+        String cookie = null;
+        boolean approvedNow = false, changed;
+        synchronized (pairLock) {
+            changed = expirePendingLocked(now);
+            pruneRecentLocked(now);
+            PairRec rec = pairRecent.get(id);
+            if (rec != null && rec.key.equals(key)) {
+                if (rec.state == PairRec.APPROVED) {
+                    status = 200; json = "{\"ok\":true,\"state\":\"approved\"}";
+                    cookie = sessionCookie(rec.token);
+                } else if (rec.state == PairRec.DENIED) {
+                    status = 410; json = "{\"ok\":false,\"err\":\"denied\"}";
+                } else {
+                    status = 410; json = "{\"ok\":false,\"err\":\"expired\"}";
+                }
+            } else if (pending == null || !pending.id.equals(id)) {
+                status = (rec != null) ? 401 : 404;
+                json = "{\"ok\":false,\"err\":\"" + (status == 401 ? "key" : "gone") + "\"}";
+            } else if (!pending.key.equals(key)) {
+                status = 401; json = "{\"ok\":false,\"err\":\"key\"}";
+            } else if (sessions.size() >= MAX_SESSIONS) {
+                status = 403; json = "{\"ok\":false,\"err\":\"full\"}";
+            } else {
+                String token = approveLocked(pending);
+                status = 200; json = "{\"ok\":true,\"state\":\"approved\"}";
+                cookie = sessionCookie(token);
+                approvedNow = true;
             }
-            String token = UUID.randomUUID().toString();
-            sessions.add(token);
-            pairFails = 0;
-            Log.d("HeckYeahFS", "remote paired n=" + sessions.size());
-            writeJson(out, 200, "{\"ok\":true}",
-                    "Set-Cookie: hy=" + token + "; Path=/; Max-Age=31536000\r\n");
+        }
+        if (changed) notifyPairingChanged();
+        if (approvedNow) {
+            Log.d("HeckYeahFS", "remote paired via=phone n=" + sessions.size());
             notifySessionsChanged();
-            return;
+            notifyPairingChanged();
         }
-        pairFails++;
-        if (pairFails >= MAX_PAIR_FAILS) {
-            pairLockUntil = now + PAIR_LOCK_MS;
-            pairFails = 0;
-            Log.d("HeckYeahFS", "remote pairing locked 60s");
+        writeJson(out, status, json, cookie);
+    }
+
+    /** POST /pair/cancel {id,key}: the phone gives up its request. */
+    private void handlePairCancel(OutputStream out, byte[] body) throws Exception {
+        String[] ids = pairBodyIds(body);
+        boolean cancelled = false;
+        synchronized (pairLock) {
+            expirePendingLocked(System.currentTimeMillis());
+            if (pending != null && pending.id.equals(ids[0]) && pending.key.equals(ids[1])) {
+                cancelled = finishPendingLocked(PairRec.DENIED, null);
+            }
         }
-        writeJson(out, 401, "{\"ok\":false,\"err\":\"pin\"}", null);
+        if (cancelled) {
+            Log.d("HeckYeahFS", "remote pairing cancelled by phone");
+            notifyPairingChanged();
+        }
+        writeJson(out, 200, "{\"ok\":true}", null);
     }
 
     private String pageHtml() {
@@ -396,7 +779,9 @@ public class RemoteServer {
     private static void writeJson(OutputStream out, int code, String json,
                                   String extraHeaders) throws Exception {
         String reason = code == 200 ? "OK" : code == 401 ? "Unauthorized"
-                : code == 403 ? "Forbidden" : code == 429 ? "Too Many Requests" : "Error";
+                : code == 403 ? "Forbidden" : code == 404 ? "Not Found"
+                : code == 409 ? "Conflict" : code == 410 ? "Gone"
+                : code == 429 ? "Too Many Requests" : "Error";
         writeResponse(out, code, reason, "application/json",
                 json.getBytes(StandardCharsets.UTF_8), extraHeaders);
     }
@@ -625,8 +1010,12 @@ public class RemoteServer {
                     ui.post(() -> host.remoteLongTap());
                     break;
                 case "scroll": {
+                    // v1.33: dx joins dy (horizontal trackpad pan).
+                    // Old dy-only messages still parse: dx defaults 0.
+                    final double dx = o.optDouble("dx", 0);
                     final double dy = o.optDouble("dy", 0);
-                    ui.post(() -> host.remoteScroll((int) Math.round(dy)));
+                    ui.post(() -> host.remoteScroll((int) Math.round(dx),
+                            (int) Math.round(dy)));
                     break;
                 }
                 case "back":
@@ -644,6 +1033,9 @@ public class RemoteServer {
                 case "playpause":
                     ui.post(() -> host.remotePlayPause());
                     break;
+                case "pip":
+                    ui.post(() -> host.remotePip());
+                    break;
                 case "url": {
                     final String u = o.optString("u", "");
                     ui.post(() -> host.remoteUrl(u));
@@ -657,15 +1049,27 @@ public class RemoteServer {
                 case "key": {
                     // "enter" is the v1.19 type-field Enter (page JS);
                     // v1.22 adds physical-remote keys for D-pad mode.
+                    // v1.39: a direction key carrying h (1 = hold
+                    // start, 0 = release) routes to remoteKeyHold -
+                    // the TV repeats it. No h = today's single fire.
                     final String k = o.optString("k", "");
-                    if ("enter".equals(k)) {
+                    final boolean isDir = "up".equals(k) || "down".equals(k)
+                            || "left".equals(k) || "right".equals(k);
+                    if (isDir && o.has("h")) {
+                        final boolean down = o.optInt("h", 0) != 0;
+                        ui.post(() -> host.remoteKeyHold(k, down));
+                    } else if ("enter".equals(k)) {
                         ui.post(() -> host.remoteEnterKey());
-                    } else if ("up".equals(k) || "down".equals(k)
-                            || "left".equals(k) || "right".equals(k)
-                            || "ok".equals(k) || "back".equals(k)
+                    } else if (isDir || "ok".equals(k) || "back".equals(k)
                             || "menu".equals(k)) {
                         ui.post(() -> host.remoteKey(k));
                     }
+                    break;
+                }
+                case "touch": {
+                    // v1.39: trackpad engagement heartbeat (see Host).
+                    final boolean down = o.optInt("d", 0) != 0;
+                    ui.post(() -> host.remoteTouch(down));
                     break;
                 }
                 case "vol": {

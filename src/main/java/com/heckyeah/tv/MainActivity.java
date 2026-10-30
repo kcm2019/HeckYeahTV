@@ -3,6 +3,7 @@ package com.heckyeah.tv;
 import android.animation.AnimatorListenerAdapter;
 import android.animation.ValueAnimator;
 import android.app.Activity;
+import android.app.ActivityManager;
 import android.app.AlertDialog;
 import android.app.Instrumentation;
 import android.content.ClipData;
@@ -12,12 +13,15 @@ import android.view.ContextThemeWrapper;
 import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
+import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
+import android.content.res.Configuration;
 import android.content.SharedPreferences;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Outline;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.PorterDuff;
@@ -30,6 +34,7 @@ import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.media.AudioManager;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -44,6 +49,7 @@ import android.view.MotionEvent;
 import android.view.SurfaceView;
 import android.view.TextureView;
 import android.view.View;
+import android.view.ViewOutlineProvider;
 import android.view.ViewTreeObserver;
 import android.view.ViewGroup;
 import android.view.WindowManager;
@@ -136,6 +142,9 @@ public class MainActivity extends Activity {
     private static final String KEY_APPEARANCE = "browser_appearance"; // dark (default) | light
     private static final String KEY_VIDEO_LOCK = "video_scroll_lock"; // v1.13: default ON
     private static final String KEY_REMOTE = "remote_on"; // v1.19: phone remote server, default OFF
+    private static final String KEY_PIP_AUTO = "pip_auto_done"; // v1.36: Done auto-PiP, default ON
+    private static final String KEY_PIP_SIZE = "pip_size";        // v1.36: 0=Small 1=Medium 2=Large, default 1 (in-app window)
+    private static final String KEY_PIP_CORNER = "pip_corner";    // v1.36: 0=BR 1=BL 2=TR 3=TL, default 0 (in-app window)
     private static final String KEY_RESUME = "resume_state";    // url SEP title SEP applet SEP cat SEP ts SEP seek
     private static final String SEP = "\u0001";
     private static final int RW_CAP = 12;
@@ -220,6 +229,12 @@ public class MainActivity extends Activity {
     // never handed as a custom view, so fsView stays null) never
     // armed the v1.3 fade and the cursor burned in over the video.
     private boolean cursorFaded = false;
+    // v1.40: true only while the FS idle fade itself hid the nav
+    // bar (fsFadeRunnable's header half). pokeFsCursor restores
+    // the bar with the cursor on the next interaction; FS exit
+    // paths clear it via cancelFsFade. Scroll-driven hides never
+    // set it, so their show/hide logic is untouched.
+    private boolean headerFadeHidden = false;
     /** Fullscreen-like = a video is covering the screen, whether
      *  Chromium handed us the custom view (fsView) or the page
      *  faked it (pseudoFs). The raw pseudoFs field is safe here:
@@ -228,11 +243,32 @@ public class MainActivity extends Activity {
      *  cancels the fade explicitly - plus fsFadeRunnable re-checks
      *  this at fire time regardless. */
     private boolean fsLikeActive() { return fsView != null || pseudoFs; }
+    // v1.33: idle fade for the fullscreen-like cursor - 5s (was
+    // 10s through v1.32). pokeFsCursor() is the ONLY arm site for
+    // fsFadeRunnable, and it routes through this constant.
+    private static final long CURSOR_FADE_MS = 5000;
     private final Runnable fsFadeRunnable = new Runnable() {
         @Override public void run() {
-            if (fsLikeActive() && browserMouse && cursorView != null) {
+            if (!fsLikeActive()) return;
+            // Cursor half: mouse sub-mode only, exactly as before
+            // (cursorFaded is never set in D-pad sub-mode, so
+            // refreshCursor's legitFade logic is unaffected).
+            if (browserMouse && cursorView != null) {
                 cursorFaded = true;
                 cursorView.animate().alpha(0f).setDuration(300).start();
+            }
+            // v1.40 header half: the nav bar idles out WITH the
+            // cursor in fullscreen. Entering real FS restores the
+            // bar (showHeader(false) in showFullscreen) and until
+            // now nothing hid it again short of a scroll/tap path -
+            // Kurt: "in full screen the nav bar will stay on top
+            // until I click on the content again." Only a bar that
+            // is currently shown is fade-hidden (pseudo-FS already
+            // hid its bar at entry, so this no-ops there).
+            if (!headerHidden && headerBlock != null) {
+                hideHeader();
+                headerFadeHidden = true;
+                Log.d("HeckYeahFS", "header fade hide");
             }
         }
     };
@@ -241,12 +277,25 @@ public class MainActivity extends Activity {
             cursorView.animate().cancel(); cursorView.setAlpha(1f);
         }
         cursorFaded = false;
+        // v1.40: the bar returns WITH the cursor, same gesture.
+        if (headerFadeHidden) {
+            headerFadeHidden = false;
+            if (fsLikeActive()) {
+                showHeader(true);
+                Log.d("HeckYeahFS", "header fade show");
+            }
+        }
         ui.removeCallbacks(fsFadeRunnable);
-        if (fsLikeActive() && browserMouse) ui.postDelayed(fsFadeRunnable, 10000);
+        // v1.40: armed whenever fsLike is active, in BOTH
+        // sub-modes - the header half of the fade has no cursor
+        // to wait for in D-pad sub-mode. The cursor half stays
+        // mouse-gated inside the runnable.
+        if (fsLikeActive()) ui.postDelayed(fsFadeRunnable, CURSOR_FADE_MS);
     }
     private void cancelFsFade() {
         ui.removeCallbacks(fsFadeRunnable);
         cursorFaded = false;
+        headerFadeHidden = false; // v1.40: FS exit paths funnel through here - no stale fade state survives
         if (cursorView != null) { cursorView.animate().cancel(); cursorView.setAlpha(1f); }
     }
 
@@ -971,6 +1020,7 @@ public class MainActivity extends Activity {
     private Button browserModeBtnSettings, adblockBtnSettings, cursorBtnSettings, scaleBtnSettings;
     private Button videoLockBtnSettings; // v1.13
     private Button remoteBtnSettings; // v1.19
+    private Button pipAutoBtnSettings, pipSizeBtnSettings, pipCornerBtnSettings; // v1.36
 
     private WebView webView;
     private LinearLayout browserCol;
@@ -998,9 +1048,31 @@ public class MainActivity extends Activity {
         }
     };
     private FrameLayout fsContainer;
+    // v1.33: in-app picture-in-picture (Part 3). Fire OS 6 is
+    // API 25 - no Activity PiP API (26+) - so PiP is the browser
+    // pane itself, reparented into a floating overlay above the
+    // menu screens while its page (and playing video) lives on.
+    // Runtime-only state; nothing here is persisted.
+    private boolean pipActive = false;
+    // v1.34: NATIVE TV picture-in-picture. The v1.33 note above was
+    // wrong for televisions: phone PiP is API 26, but TV PiP -
+    // Activity.enterPictureInPictureMode() (no-arg) - exists since
+    // API 24, and SmartTube uses it on this very Fire TV. Native is
+    // now the primary PiP (startPip tries it first); the v1.33
+    // in-app window remains the fallback when the device lacks the
+    // feature or the call refuses. nativePip is runtime-only.
+    private boolean nativePip = false;
+    private boolean nativePipHeaderWasHidden = false; // header state to restore on native exit
+    private boolean videoPresentPaused = false; // poll: a paused-but-present video (button gating)
+    private boolean lastPipAvail = false;       // last dim state pushed to the PiP toolbar icon
+    private FrameLayout pipFrame;        // floating container above the menu screens
+    private TextView pipCloseChip;       // the frame's second focusable control (✕)
+    private int pipFrameId = View.NO_ID, pipCloseId = View.NO_ID;
+    private boolean pipHeaderWasHidden = false; // header state to restore on exit
+    private ViewGroup.LayoutParams pipSavedBrowserLp; // browserPane's full-size params
     private TextView urlPill;
     private ProgressBar pageProgress;
-    private FrameLayout tbBack, tbFwd, tbReload, tbMode, tbPhone, tbGear, tbDone;
+    private FrameLayout tbBack, tbFwd, tbPip, tbReload, tbMode, tbPhone, tbGear, tbDone;
     private Button homePhoneBtn; // v1.22: Home header Phone button (rebuilt with Home)
     // v1.25: Mode/Phone are icon buttons in the browser toolbar. The
     // icons are drawn on a Canvas at build time (font glyphs for a
@@ -1011,7 +1083,7 @@ public class MainActivity extends Activity {
     // v1.27: the rest of the toolbar is canvas-drawn icons too
     // (Back / Forward / Reload / Settings / Done), each its own
     // drawable so Back/Forward can dim independently.
-    private BitmapDrawable backIcon, fwdIcon, reloadIcon, gearIcon, doneIcon;
+    private BitmapDrawable backIcon, fwdIcon, pipIcon, reloadIcon, gearIcon, doneIcon;
     // v1.25: one shared name bubble for toolbar elements, shown on
     // mouse hover (350ms dwell) and on D-pad toolbar focus (150ms).
     private TextView toolbarTipView;
@@ -1025,7 +1097,7 @@ public class MainActivity extends Activity {
         }
     };
     private final List<View> toolbarViews = new ArrayList<>();
-    private int toolbarIndex = 2;       // default: URL pill
+    private int toolbarIndex = 3;       // default: URL pill (v1.34: PiP stop inserted at 2)
     private boolean toolbarFocus = false;
 
     private View fsView;
@@ -1071,6 +1143,129 @@ public class MainActivity extends Activity {
     private CursorView cursorView;
     private boolean browserMouse = true;    // browser sub-mode (mouse default)
     private float cursorX = 480f, cursorY = 270f;
+    // v1.35: TIME-BASED edge-push scrolling. Until now moveCursor
+    // fired a fixed doScrollBy step (dp(140)/dp(80)) PER MOVE
+    // EVENT when the cursor pushed past a WebView edge - fine at
+    // the physical remote's key-repeat rate, but the phone
+    // trackpad streams moves at touchmove rate (~60/s), so edge
+    // scrolling ran away at ~16,800 px/s (60 x 280px). Now a move
+    // event only RECORDS the push (direction + time); this loop
+    // scrolls at a capped velocity with a gentle ramp-in.
+    // Velocities are raw px/sec.
+    // v1.40: LATCHED push. Kurt's v1.39 field report: the scroll
+    // STILL died when the finger stopped moving, and 260 px/s
+    // read as very slow. The freshness model is gone as a stop
+    // condition (v1.39's heartbeat chain read correct end-to-end
+    // yet the scroll still died on device, so the design no
+    // longer depends on it): once noteEdgePush records an axis,
+    // the loop scrolls until a REAL stop -
+    //   * the cursor leaves the edge (per-axis geometry drop in
+    //     the tick) or a move reverses the axis (moveCursor);
+    //   * a transition stopEdgePush() (screen / mode / FS / PiP /
+    //     page load - the v1.35 call sites, unchanged);
+    //   * the wind-down deadline edgeStopAt, armed by input
+    //     RELEASE (phone touch lift via remoteTouch(false), or a
+    //     physical arrow ACTION_UP) - 150ms of glide-out;
+    //   * a deliberate phone command (tap / long-tap / scroll /
+    //     key / key-hold / Done) - a new intent ends the latch;
+    //   * a 20s absolute cap (bounds any lost stop, e.g. the
+    //     phone dying mid-hold with the cursor parked at an
+    //     edge), logged "edge push stop why=cap".
+    // Fresh move input (noteEdgePush) and the phone's engagement
+    // heartbeat (remoteTouch(true)) clear edgeStopAt - engagement
+    // re-asserted. Speeds up per Kurt: 400 / 300 px/s.
+    private static final float EDGE_SCROLL_VY = 400f;  // ~0.37 of the 1080px viewport per sec
+    private static final float EDGE_SCROLL_VX = 300f;
+    private static final long EDGE_RAMP_MS = 500;       // 35% velocity ramping to full over this span
+    private static final long EDGE_STOP_GLIDE_MS = 150; // release glide-out before the latch drops
+    private static final long EDGE_PUSH_CAP_MS = 20000; // absolute cap on one continuous push
+    private int edgePushX = 0, edgePushY = 0;           // -1/0/1 per axis
+    private long edgePushSince = 0;                     // uptime the current continuous push began
+    private long edgeStopAt = 0;                        // wind-down deadline; 0 = none armed
+    private long edgeTickLastAt = 0;
+    private boolean edgeLoopRunning = false;
+    private final Runnable edgeScrollTick = new Runnable() {
+        @Override public void run() {
+            long now = SystemClock.uptimeMillis();
+            boolean contextOk = currentScreen == browserPane && fsView == null
+                    && !pipActive && !nativePip && webView != null;
+            if (!contextOk || (edgePushX == 0 && edgePushY == 0)) {
+                stopEdgePush();
+                return;
+            }
+            if (edgeStopAt > 0 && now >= edgeStopAt) { stopEdgePush(); return; }
+            if (now - edgePushSince > EDGE_PUSH_CAP_MS) {
+                Log.d("HeckYeahFS", "edge push stop why=cap");
+                stopEdgePush();
+                return;
+            }
+            // Drop any axis whose edge the cursor has left.
+            int[] loc = new int[2]; webView.getLocationInWindow(loc);
+            int wr = loc[0] + webView.getWidth(), wb = loc[1] + webView.getHeight();
+            if (edgePushY > 0 && cursorY < wb - 1) edgePushY = 0;
+            if (edgePushY < 0 && cursorY > loc[1] && cursorY > 0) edgePushY = 0;
+            if (edgePushX > 0 && cursorX < wr - 1) edgePushX = 0;
+            if (edgePushX < 0 && cursorX > loc[0] && cursorX > 0) edgePushX = 0;
+            if (edgePushX == 0 && edgePushY == 0) { stopEdgePush(); return; }
+            long dtMs = Math.max(1, Math.min(100, now - edgeTickLastAt)); // v1.39: clamp 64 -> 100ms
+            edgeTickLastAt = now;
+            float scale = edgeRampScale(now);
+            int sx = Math.round(edgePushX * EDGE_SCROLL_VX * scale * dtMs / 1000f);
+            int sy = Math.round(edgePushY * EDGE_SCROLL_VY * scale * dtMs / 1000f);
+            // doScrollBy keeps governing: document clamp +
+            // video-bounded area apply to every tick's step.
+            if (sx != 0 || sy != 0) doScrollBy(sx, sy);
+            ui.postDelayed(this, 16);
+        }
+    };
+
+    /** v1.35: ramp for a continuous push: partial velocity at
+     *  the start, easing linearly to full over EDGE_RAMP_MS - a
+     *  brush against the edge nudges, a deliberate hold glides.
+     *  v1.39: base lowered 45% -> 35%, span 400 -> 600ms.
+     *  v1.40: span 600 -> 500ms to pair with the faster speeds. */
+    private float edgeRampScale(long now) {
+        long held = now - edgePushSince;
+        if (held >= EDGE_RAMP_MS) return 1f;
+        return 0.35f + 0.65f * (held / (float) EDGE_RAMP_MS);
+    }
+
+    /** v1.35: record an edge push from a move event (replaces
+     *  the old per-event doScrollBy steps). Recording the same
+     *  push twice in one event is idempotent, which is what
+     *  retires the v1.11 transit double-step bookkeeping. */
+    private void noteEdgePush(int dirX, int dirY) {
+        long now = SystemClock.uptimeMillis();
+        boolean wasActive = edgePushX != 0 || edgePushY != 0;
+        if (dirX != 0) edgePushX = dirX;
+        if (dirY != 0) edgePushY = dirY;
+        if (!wasActive) edgePushSince = now;
+        edgeStopAt = 0; // v1.40: fresh input re-arms the latch
+        if (!edgeLoopRunning) {
+            edgeLoopRunning = true;
+            edgeTickLastAt = now;
+            ui.post(edgeScrollTick);
+        }
+    }
+
+    /** v1.40: arm the wind-down deadline - the latch drops
+     *  EDGE_STOP_GLIDE_MS from now (a glide-out, not a cliff).
+     *  Armed by input release: the phone's touch lift and
+     *  physical arrow ACTION_UPs. No-op with no push recorded. */
+    private void armEdgeStop() {
+        if (edgePushX == 0 && edgePushY == 0) return;
+        edgeStopAt = SystemClock.uptimeMillis() + EDGE_STOP_GLIDE_MS;
+    }
+
+    /** v1.35: push state cleared + loop stopped. Called by the
+     *  tick itself (context/edge-left/deadline/cap) and on screen,
+     *  mode, fullscreen and PiP transitions. */
+    private void stopEdgePush() {
+        edgePushX = 0; edgePushY = 0;
+        edgeStopAt = 0;
+        edgeLoopRunning = false;
+        ui.removeCallbacks(edgeScrollTick);
+    }
     private long centerDownAt = 0;
     private long lastMenuShownAt = 0;
     private int browserDialogDepth = 0;
@@ -1252,13 +1447,14 @@ public class MainActivity extends Activity {
     private static final String VIDEO_POLL_JS =
             "(function(){try{"
             + "var IW=window.innerWidth,IH=window.innerHeight;"
-            + "var best=null,bestArea=0;"
+            + "var best=null,bestArea=0,bestP=0,bestPArea=0;"
             + "function scan(doc,ox,oy){"
             + "var vs;try{vs=doc.querySelectorAll('video');}catch(e){return;}"
             + "for(var i=0;i<vs.length;i++){var v=vs[i];"
             + "try{"
-            + "if(v.paused||v.ended)continue;"
-            + "if(!(v.readyState>=2||v.currentTime>0))continue;"
+            + "if(v.ended)continue;"
+            + "var pz=v.paused?1:0;"
+            + "if(!pz&&!(v.readyState>=2||v.currentTime>0))continue;"
             + "var r=v.getBoundingClientRect();"
             + "if(r.width<160||r.height<90)continue;"
             + "var L=r.left+ox,T=r.top+oy,R=r.right+ox,B=r.bottom+oy;"
@@ -1267,7 +1463,8 @@ public class MainActivity extends Activity {
             + "var vis=ix*iy,area=r.width*r.height;"
             + "if(area<=0)continue;"
             + "if(vis<0.5*area&&vis<0.5*IW*IH)continue;"
-            + "if(area>bestArea){bestArea=area;best={l:L,t:T,r:R,b:B};}"
+            + "if(pz){if(area>bestPArea){bestPArea=area;bestP=1;}}"
+            + "else if(area>bestArea){bestArea=area;best={l:L,t:T,r:R,b:B};}"
             + "}catch(e){}}"
             + "var fs;try{fs=doc.querySelectorAll('iframe');}catch(e){return;}"
             + "for(var j=0;j<fs.length;j++){var f=fs[j],cd=null;"
@@ -1284,7 +1481,7 @@ public class MainActivity extends Activity {
             + "var sy=window.scrollY||window.pageYOffset||0;"
             + "var fe='';try{var fsel=document.fullscreenElement||document.webkitFullscreenElement;"
             + "if(fsel)fe=fsel.tagName||'';}catch(e){}"
-            + "var o={f:best?1:0,iw:IW,ih:IH,dw:dw,dh:dh,sx:sx,sy:sy,fe:fe,ps:0};"
+            + "var o={f:best?1:0,p:bestP,iw:IW,ih:IH,dw:dw,dh:dh,sx:sx,sy:sy,fe:fe,ps:0};"
             + "if(best){o.l=best.l+sx;o.t=best.t+sy;o.r=best.r+sx;o.b=best.b+sy;"
             + "o.vl=best.l;o.vt=best.t;o.vr=best.r;o.vb=best.b;"
             + "if((best.r-best.l)>=0.9*IW&&(best.b-best.t)>=0.9*IH)o.ps=1;}"
@@ -1311,6 +1508,8 @@ public class MainActivity extends Activity {
      *  good poll lands. */
     private void clearVideoData() {
         videoFound = false;
+        videoPresentPaused = false; // v1.34
+        lastPipAvail = false;
         vidViewL = vidViewT = vidViewR = vidViewB = 0;
         videoDataAt = 0;
         pseudoFs = false; // v1.16: silent reset (navigation / real FS / Done) - no OFF log
@@ -1326,6 +1525,7 @@ public class MainActivity extends Activity {
                     boolean was = videoFound;
                     boolean wasPseudo = pseudoFs;
                     videoFound = o.optInt("f", 0) == 1;
+                    videoPresentPaused = o.optInt("p", 0) == 1; // v1.34: paused-but-present (PiP button gating)
                     vidInnerW = (float) o.optDouble("iw", 0);
                     vidInnerH = (float) o.optDouble("ih", 0);
                     vidDocW = (float) o.optDouble("dw", 0);
@@ -1359,6 +1559,13 @@ public class MainActivity extends Activity {
                     }
                     pseudoFs = nowPseudo;
                     videoDataAt = System.currentTimeMillis();
+                    // v1.34: the PiP toolbar icon dims with video
+                    // availability - refresh it when that flips.
+                    boolean pipAvailNow = pipVideoPresent(false);
+                    if (pipAvailNow != lastPipAvail) {
+                        lastPipAvail = pipAvailNow;
+                        refreshNavIcons();
+                    }
                     // v1.15 (provable logging): detection flips are
                     // logged under HeckYeahFS, so an EMPTY dump from
                     // now on unambiguously means this build is not
@@ -1592,7 +1799,7 @@ public class MainActivity extends Activity {
         // THIS build leaves exactly one unmistakable line, so
         // an empty HeckYeahFS dump can never again be confused
         // with "the guard saw nothing to fix".
-        Log.d("HeckYeahFS", "alive version=1.32 code=33");
+        Log.d("HeckYeahFS", "alive version=1.40 code=41");
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         browserMouse = prefs.getBoolean(KEY_MOUSE, true);
         AdBlock.enabled = prefs.getBoolean(KEY_ADBLOCK, true);
@@ -1623,7 +1830,15 @@ public class MainActivity extends Activity {
     protected void onPause() {
         super.onPause();
         // App backgrounded while browsing: don't let media keep playing.
-        if (webView != null && currentScreen == browserPane && !browserSuspended) {
+        // v1.34 audit: in native PiP the activity sits in the
+        // PAUSED lifecycle state the whole time the window floats
+        // (and other apps coming forward over it re-fires this) -
+        // pausing the WebView here would freeze the very playback
+        // PiP exists to continue, so native PiP is exempt. The
+        // in-app PiP never reaches this code path differently
+        // (the activity stays resumed throughout).
+        if (webView != null && currentScreen == browserPane && !browserSuspended
+                && !inNativePip()) {
             try { webView.onPause(); } catch (Exception ignored) {}
         }
     }
@@ -1638,6 +1853,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        stopKeyRepeat("destroy"); // v1.39
         stopRemoteServer(); // v1.19
         super.onDestroy();
     }
@@ -1846,7 +2062,13 @@ public class MainActivity extends Activity {
 
     private void showScreen(View v) {
         View[] all = {homeScroll, catScroll, shelfScroll, searchPane, settingsScroll, browserPane};
-        for (View x : all) x.setVisibility(x == v ? View.VISIBLE : View.GONE);
+        for (View x : all) {
+            // v1.33: while PiP is active the browser pane lives
+            // inside the floating frame over a menu screen - it
+            // must stay VISIBLE (a GONE WebView can pause media).
+            if (x == browserPane && pipActive) { x.setVisibility(View.VISIBLE); continue; }
+            x.setVisibility(x == v ? View.VISIBLE : View.GONE);
+        }
         currentScreen = v;
         currentScroll = v instanceof ScrollView ? (ScrollView) v : null;
         if (v == browserPane) {
@@ -1857,6 +2079,7 @@ public class MainActivity extends Activity {
             cancelAutoPairPopup(); // no pending/visible auto pairing card off-browser
             hideToolbarTip(); // v1.25: tooltips exist only over the browser toolbar
             cancelActionFeedback(); // v1.26: the center flash is browser-only
+            stopEdgePush(); // v1.35: no edge-push loop off-browser
         }
         if (v == settingsScroll) {
             refreshSettingsLabels();
@@ -1919,7 +2142,10 @@ public class MainActivity extends Activity {
      */
     private void refreshCursor(String why) {
         if (cursorView == null) return;
-        boolean show = currentScreen == browserPane && browserMouse;
+        // v1.34: native PiP keeps the cursor hidden - the small
+        // window is not interactive, and the watchdog in
+        // moveCursor must not resurrect it there.
+        boolean show = currentScreen == browserPane && browserMouse && !nativePip;
         if (!show) {
             if (cursorView.getVisibility() == View.VISIBLE)
                 Log.d("HeckYeahFS", "cursor hide why=" + why);
@@ -2830,8 +3056,22 @@ public class MainActivity extends Activity {
             boolean on = !prefs.getBoolean(KEY_VIDEO_LOCK, true);
             prefs.edit().putBoolean(KEY_VIDEO_LOCK, on).apply(); refreshSettingsLabels();
         });
-        // v1.19: phone remote - a LAN web page (PIN-paired, max 2
-        // phones) that drives this browser: trackpad cursor, taps,
+        // v1.36: picture-in-picture group - the same three prefs
+        // the browser gear sheet edits (both surfaces read the
+        // prefs when built/refreshed, so they never disagree).
+        // Auto governs ONLY the Done trigger; size/corner govern
+        // ONLY the in-app window (system PiP size is Fire TV's).
+        pipAutoBtnSettings = settingRow(pane, "Auto-PiP when leaving with a playing video", v -> {
+            boolean on = !prefs.getBoolean(KEY_PIP_AUTO, true);
+            prefs.edit().putBoolean(KEY_PIP_AUTO, on).apply(); refreshSettingsLabels();
+        });
+        pipSizeBtnSettings = settingRow(pane, "PiP window size", v -> cyclePipSize());
+        pipCornerBtnSettings = settingRow(pane, "PiP window corner", v -> cyclePipCorner());
+        TextView pipNote = tv("Size and corner apply to the in-app window. System PiP size is set by Fire TV.", 12, DIM, false);
+        pipNote.setPadding(0, 0, 0, dp(6));
+        pane.addView(pipNote);
+        // v1.19: phone remote - a LAN web page (paired by matching
+        // code since v1.37, max 2 phones) that drives this browser: trackpad cursor, taps,
         // navigation, URL entry, typing, volume and seek.
         remoteBtnSettings = settingRow(pane, "Phone remote (control the browser from your phone)", v -> {
             boolean on = !prefs.getBoolean(KEY_REMOTE, false);
@@ -2916,6 +3156,9 @@ public class MainActivity extends Activity {
         adblockBtnSettings.setText(prefs.getBoolean(KEY_ADBLOCK, true) ? "ON" : "OFF");
         cursorBtnSettings.setText(cursorStepLabel());
         if (videoLockBtnSettings != null) videoLockBtnSettings.setText(prefs.getBoolean(KEY_VIDEO_LOCK, true) ? "ON" : "OFF");
+        if (pipAutoBtnSettings != null) pipAutoBtnSettings.setText(prefs.getBoolean(KEY_PIP_AUTO, true) ? "ON" : "OFF");
+        if (pipSizeBtnSettings != null) pipSizeBtnSettings.setText(pipSizeLabel());
+        if (pipCornerBtnSettings != null) pipCornerBtnSettings.setText(pipCornerLabel());
         if (remoteBtnSettings != null) remoteBtnSettings.setText(prefs.getBoolean(KEY_REMOTE, false) ? "ON" : "OFF");
         if (appearanceBtnSettings != null) appearanceBtnSettings.setText(browserDark() ? "Dark" : "Light");
         if (omdbBtnSettings != null) omdbBtnSettings.setText(
@@ -3113,6 +3356,7 @@ public class MainActivity extends Activity {
         int t = tbText();
         if (backIcon != null) backIcon.setColorFilter(t, PorterDuff.Mode.SRC_IN);
         if (fwdIcon != null) fwdIcon.setColorFilter(t, PorterDuff.Mode.SRC_IN);
+        if (pipIcon != null) pipIcon.setColorFilter(t, PorterDuff.Mode.SRC_IN);
         if (reloadIcon != null) reloadIcon.setColorFilter(t, PorterDuff.Mode.SRC_IN);
         if (gearIcon != null) gearIcon.setColorFilter(t, PorterDuff.Mode.SRC_IN);
         if (doneIcon != null) doneIcon.setColorFilter(DONE_RED, PorterDuff.Mode.SRC_IN);
@@ -3128,6 +3372,9 @@ public class MainActivity extends Activity {
         if (webView == null) return;
         if (backIcon != null) backIcon.setAlpha(webView.canGoBack() ? 255 : 90);
         if (fwdIcon != null) fwdIcon.setAlpha(webView.canGoForward() ? 255 : 90);
+        // v1.34: PiP dims the same way - full strength only while
+        // a video (playing or paused) is present per the fresh poll.
+        if (pipIcon != null) pipIcon.setAlpha(pipVideoPresent(false) ? 255 : 90);
     }
 
     /**
@@ -3275,6 +3522,19 @@ public class MainActivity extends Activity {
             xp.setStrokeWidth(s * 0.09f);
             c.drawLine(s * 0.335f, s * 0.335f, s * 0.665f, s * 0.665f, xp);
             c.drawLine(s * 0.665f, s * 0.335f, s * 0.335f, s * 0.665f, xp);
+        } else if ("pip".equals(kind)) {
+            // v1.34: SF "pip.enter" discipline - a stroked rounded
+            // rect (the screen) with a small FILLED rounded rect in
+            // its bottom-right quadrant (the floating window). The
+            // filled inset is what reads at TV distance. Geometry
+            // verified in the PIL bar prototype before porting:
+            // outer ink spans 0.104-0.896 x 0.164-0.836 of the
+            // canvas (stroke included), i.e. exactly centered, and
+            // the glyph's optical size matches the rest of the set.
+            RectF outer = new RectF(s * 0.14f, s * 0.20f, s * 0.86f, s * 0.80f);
+            c.drawRoundRect(outer, s * 0.10f, s * 0.10f, p);
+            RectF inner = new RectF(s * 0.50f, s * 0.50f, s * 0.76f, s * 0.68f);
+            c.drawRoundRect(inner, s * 0.035f, s * 0.035f, fill);
         } else { // "phone": slimmer outline, smaller speaker + dot
             RectF body = new RectF(s * 0.295f, s * 0.075f, s * 0.705f, s * 0.925f);
             c.drawRoundRect(body, s * 0.085f, s * 0.085f, p);
@@ -3373,6 +3633,17 @@ public class MainActivity extends Activity {
         setBtnIcon(tbFwd, fwdIcon, tbText());
         tbFwd.setContentDescription("Forward");
         tbFwd.setOnClickListener(v -> { if (webView.canGoForward()) webView.goForward(); });
+        // v1.34: PiP button - Kurt's placement: left cluster,
+        // immediately right of Back/Forward, as a third segment.
+        // Its glyph dims with video availability (refreshNavIcons,
+        // same treatment as Back/Forward); the click routes to
+        // the unified startPip, which toasts when no video is on
+        // the page.
+        tbPip = toolbarBtn();
+        pipIcon = strokeIcon("pip");
+        setBtnIcon(tbPip, pipIcon, tbText());
+        tbPip.setContentDescription("Picture in Picture");
+        tbPip.setOnClickListener(v -> startPip("button"));
         // URL is a BUTTON (the address capsule), not an EditText:
         // D-pad focus lands on it as one stop; clicking opens the
         // URL editor dialog (which pre-fills the FULL current URL
@@ -3430,8 +3701,8 @@ public class MainActivity extends Activity {
         tbDone.setContentDescription("Done");
         tbDone.setOnClickListener(v -> closeBrowser());
 
-        // The capsule replaces urlPill as the URL focus stop; the
-        // stop ORDER is unchanged: Back, Forward, URL, Reload,
+        // The capsule replaces urlPill as the URL focus stop.
+        // v1.34 stop order: Back, Forward, PiP, URL, Reload,
         // Mode, Phone, Gear, Done.
         addrCapsule = new FrameLayout(this);
         addrCapsule.setOnClickListener(v -> openUrlDialog());
@@ -3452,7 +3723,8 @@ public class MainActivity extends Activity {
         addrCapsule.addView(tbReload, reloadLp);
 
         toolbarViews.clear();
-        toolbarViews.add(tbBack); toolbarViews.add(tbFwd); toolbarViews.add(addrCapsule);
+        toolbarViews.add(tbBack); toolbarViews.add(tbFwd); toolbarViews.add(tbPip);
+        toolbarViews.add(addrCapsule);
         toolbarViews.add(tbReload); toolbarViews.add(tbMode); toolbarViews.add(tbPhone);
         toolbarViews.add(tbGear); toolbarViews.add(tbDone);
         // v1.30: the bar is a FrameLayout so the address capsule is
@@ -3462,11 +3734,13 @@ public class MainActivity extends Activity {
         // parked the capsule - and everything in it - ~53dp left of
         // center at 1080p. Now: nav cluster pinned LEFT, capsule at
         // Gravity.CENTER, right cluster + Done pinned RIGHT.
-        // LEFT cluster: Back | Forward
+        // LEFT cluster: Back | Forward | PiP (v1.34)
         navCluster = glassCluster();
         navCluster.addView(tbBack, segmentLp());
         navCluster.addView(clusterDivider());
         navCluster.addView(tbFwd, segmentLp());
+        navCluster.addView(clusterDivider());
+        navCluster.addView(tbPip, segmentLp());
         bar.addView(navCluster, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, dp(52),
                 Gravity.LEFT | Gravity.CENTER_VERTICAL));
@@ -3579,7 +3853,8 @@ public class MainActivity extends Activity {
     // ------------------------------------------------ v1.4: auto-hiding header
 
     private void onWebScrollChanged(int oldY, int newY) {
-        if (currentScreen != browserPane || fsView != null || browserDialogDepth > 0) {
+        if (currentScreen != browserPane || fsView != null || browserDialogDepth > 0
+                || nativePip) { // v1.34: no header show/hide churn inside the PiP window
             scrollAccum = 0;
             return;
         }
@@ -3718,6 +3993,9 @@ public class MainActivity extends Activity {
             "Desktop user-agent: " + (prefs.getBoolean(KEY_DESKTOP_UA, false) ? "ON" : "OFF"),
             "Cursor speed: " + cursorStepLabel(),
             "Video scroll lock: " + (prefs.getBoolean(KEY_VIDEO_LOCK, true) ? "ON" : "OFF"),
+            "Auto-PiP: " + (prefs.getBoolean(KEY_PIP_AUTO, true) ? "ON" : "OFF"),
+            "PiP size: " + pipSizeLabel(),
+            "PiP corner: " + pipCornerLabel(),
             "Phone remote\u2026",
             "Clear cache",
             "Clear history",
@@ -3757,12 +4035,19 @@ public class MainActivity extends Activity {
                             prefs.edit().putBoolean(KEY_VIDEO_LOCK, on).apply();
                             refreshSettingsLabels(); break;
                         }
-                        case 7: ui.post(this::openRemotePanel); break; // v1.19: panel replaces the sheet (no reopen below)
-                        case 8: webView.clearCache(true); Toast.makeText(this, "Cache cleared", Toast.LENGTH_SHORT).show(); break;
-                        case 9: webView.clearHistory(); Toast.makeText(this, "History cleared", Toast.LENGTH_SHORT).show(); break;
+                        case 7: { // v1.36: Done-trigger only; PiP buttons unaffected
+                            boolean on = !prefs.getBoolean(KEY_PIP_AUTO, true);
+                            prefs.edit().putBoolean(KEY_PIP_AUTO, on).apply();
+                            refreshSettingsLabels(); break;
+                        }
+                        case 8: cyclePipSize(); break; // v1.36: in-app window; live re-apply inside
+                        case 9: cyclePipCorner(); break; // v1.36
+                        case 10: ui.post(this::openRemotePanel); break; // v1.19: panel replaces the sheet (no reopen below)
+                        case 11: webView.clearCache(true); Toast.makeText(this, "Cache cleared", Toast.LENGTH_SHORT).show(); break;
+                        case 12: webView.clearHistory(); Toast.makeText(this, "History cleared", Toast.LENGTH_SHORT).show(); break;
                         default: break;
                     }
-                    if (which != 7) ui.post(this::openBrowserSettings);
+                    if (which != 10) ui.post(this::openBrowserSettings);
                 })
                 .setNegativeButton("Close", null)
                 .create();
@@ -3774,9 +4059,63 @@ public class MainActivity extends Activity {
 
     private RemoteServer remoteServer;
     private boolean remoteHeartbeatOn = false;
+    // v1.39: TV-OWNED key repeat for phone D-pad direction holds.
+    // The phone sends one {t:"key",h:1} on press and {h:0} on
+    // release; THIS loop does the repeating (first repeat after
+    // 350ms, then every 110ms) through injectKey, so repeats flow
+    // through dispatchKeyEvent exactly like a physical remote's -
+    // Home focus steps, browser D-pad scroll and mouse-mode
+    // cursor moves all repeat from one mechanism. The v1.23
+    // phone-side interval stream died after ~3 steps in the field
+    // (page timers / touch handlers / injection lag), so the
+    // repeat moved to the side that can't be throttled. Hard cap
+    // 8s: a lost release (phone died mid-hold) can't scroll on.
+    private String keyRepeatKey = null;   // "up"|"down"|"left"|"right" while repeating
+    private int keyRepeatCode = 0;
+    private long keyRepeatStartedAt = 0;
+    private static final long KEY_REPEAT_DELAY_MS = 350;
+    private static final long KEY_REPEAT_INTERVAL_MS = 110;
+    private static final long KEY_REPEAT_CAP_MS = 8000;
+    private final Runnable keyRepeatTick = new Runnable() {
+        @Override public void run() {
+            if (keyRepeatKey == null) return;
+            if (SystemClock.uptimeMillis() - keyRepeatStartedAt >= KEY_REPEAT_CAP_MS) {
+                stopKeyRepeat("cap");
+                return;
+            }
+            injectKey(keyRepeatCode);
+            ui.postDelayed(this, KEY_REPEAT_INTERVAL_MS);
+        }
+    };
+
+    private void startKeyRepeat(String k, int code) {
+        stopKeyRepeat("replace"); // no-op when nothing is repeating
+        keyRepeatKey = k;
+        keyRepeatCode = code;
+        keyRepeatStartedAt = SystemClock.uptimeMillis();
+        Log.d("HeckYeahFS", "keyrepeat start k=" + k);
+        injectKey(code); // the first step fires immediately, like a tap
+        ui.postDelayed(keyRepeatTick, KEY_REPEAT_DELAY_MS);
+    }
+
+    /** why: release|replace|plainkey|disconnect|cap|destroy. */
+    private void stopKeyRepeat(String why) {
+        if (keyRepeatKey == null) return;
+        Log.d("HeckYeahFS", "keyrepeat stop k=" + keyRepeatKey + " why=" + why);
+        keyRepeatKey = null;
+        keyRepeatCode = 0;
+        ui.removeCallbacks(keyRepeatTick);
+    }
+
     private int lastRemotePairedCount = 0; // v1.21: for the 0 -> >0 pair transition
     private String remoteNote; // one-shot note carried by the next state push
     private TextView remotePairCountView; // live label inside the pairing panel, if open
+    // v1.37: the pairing panel's pending-request section (fields so
+    // remotePairingChanged can refresh it in place while the
+    // dialog is open; nulled by trackDialog's cleanup).
+    private TextView panelPendHead, panelPendCode, panelPendHint, panelPendIdle;
+    private LinearLayout panelPendRow;
+    private String lastPendingPairCode; // last code remotePairingChanged saw (new-request edge)
 
     // v1.28: auto pairing CARD. Same trigger semantics as the
     // v1.27 auto popup (once per browser session, 700ms after
@@ -3803,6 +4142,11 @@ public class MainActivity extends Activity {
     private ImageView pairCardQr;
     private View pairCardProgressFill;
     private boolean pairCardVisible = false;
+    // v1.37: the card has two content modes - idle (QR + address)
+    // and pending (a live pairing request: big code, request
+    // countdown). fillPairCard() sets this; the countdown text
+    // and the tick's zero behavior key off it.
+    private boolean pairCardPendingMode = false;
     private int pairCardSecondsLeft = 0;
     private int pairCardGen = 0; // invalidates stale delayed hides
     private ValueAnimator pairCardDrain;
@@ -3830,7 +4174,24 @@ public class MainActivity extends Activity {
         @Override public void run() {
             if (!pairCardVisible) return;
             pairCardSecondsLeft--;
-            if (pairCardSecondsLeft <= 0) { hidePairCard(); return; }
+            if (pairCardSecondsLeft <= 0) {
+                // v1.37: a pending card reaching zero means the
+                // request expired - re-evaluate instead of blindly
+                // hiding: refill (a fresh request restarts its own
+                // countdown) or, when the card was auto-shown FOR
+                // this request, hide it (it refills on next open).
+                if (pairCardPendingMode) {
+                    if (remoteServer != null && remoteServer.pendingPairCode() != null) {
+                        fillPairCard();
+                        startPairCardCountdown();
+                    } else {
+                        hidePairCard();
+                    }
+                } else {
+                    hidePairCard();
+                }
+                return;
+            }
             updatePairCardCountdownText();
             ui.postDelayed(this, 1000);
         }
@@ -3907,7 +4268,7 @@ public class MainActivity extends Activity {
         pairCardPinRow.setOrientation(LinearLayout.HORIZONTAL);
         pairCardPinRow.setGravity(Gravity.BOTTOM);
         pairCardPinTag = new TextView(this);
-        pairCardPinTag.setText("PIN");
+        pairCardPinTag.setText("CODE"); // v1.37: compare code (was "PIN")
         pairCardPinTag.setTextSize(12);
         pairCardPinTag.setTypeface(tf(true));
         pairCardPinRow.addView(pairCardPinTag);
@@ -3996,7 +4357,7 @@ public class MainActivity extends Activity {
         pairCardPinTag.setTextColor(dim);
         pairCardTrackBg.setColor(dark ? Color.argb(38, 255, 255, 255)
                                       : Color.argb(31, 0, 0, 0));
-        // PIN digits stay ACCENT and the QR tile stays white in
+        // Code digits stay ACCENT and the QR tile stays white in
         // both appearances (set once at build / in the drawable).
     }
 
@@ -4026,18 +4387,40 @@ public class MainActivity extends Activity {
                 + ":" + RemoteServer.PORT + "/?v=" + appVersionCode();
     }
 
-    /** Fill the card for the CURRENT server state (on: address + PIN + QR; off: turn-on prompt). */
+    /**
+     * Fill the card for the CURRENT state. v1.37: TWO on-modes -
+     * PENDING (a phone has started pairing: its compare code is
+     * the card; QR/address hidden to keep it compact; the
+     * countdown is the request's own remaining life) and IDLE
+     * (as before minus the PIN row: QR + versioned address, and
+     * a body line explaining the matching-code flow). Off mode
+     * (turn-on prompt) is unchanged.
+     */
     private void fillPairCard() {
         if (pairCard == null) return;
         applyPairCardTheme();
-        if (remoteOn()) {
+        String code = remoteOn() ? remoteServer.pendingPairCode() : null;
+        pairCardPendingMode = code != null;
+        if (pairCardPendingMode) {
+            pairCardLabel.setText("PHONE PAIRING");
+            pairCardTitle.setText("Pair this phone?");
+            pairCardBody.setText("Check the code matches your phone, then press OK"
+                    + " here — or tap Pair on the phone.");
+            pairCardBody.setVisibility(View.VISIBLE);
+            pairCardAddr.setVisibility(View.GONE);
+            pairCardPinDigits.setText(groupedCode(code));
+            pairCardPinRow.setVisibility(View.VISIBLE);
+            pairCardQrTile.setVisibility(View.GONE);
+        } else if (remoteOn()) {
+            pairCardLabel.setText("PHONE REMOTE");
             pairCardTitle.setText("Pair your phone");
-            pairCardBody.setVisibility(View.GONE);
+            pairCardBody.setText("Open the remote on your phone — a matching code"
+                    + " will appear on both screens.");
+            pairCardBody.setVisibility(View.VISIBLE);
             String url = remotePageUrl();
             pairCardAddr.setText(url);
             pairCardAddr.setVisibility(View.VISIBLE);
-            pairCardPinDigits.setText(spacedPin(remoteServer.pin()));
-            pairCardPinRow.setVisibility(View.VISIBLE);
+            pairCardPinRow.setVisibility(View.GONE);
             Bitmap qr = null;
             try { qr = renderQrBitmap(url, dp(92)); } catch (Exception ignored) {}
             if (qr != null) {
@@ -4047,6 +4430,7 @@ public class MainActivity extends Activity {
                 pairCardQrTile.setVisibility(View.GONE);
             }
         } else {
+            pairCardLabel.setText("PHONE REMOTE");
             pairCardTitle.setText("Phone remote is off");
             pairCardBody.setText("Tap this card or press OK to turn it on");
             pairCardBody.setVisibility(View.VISIBLE);
@@ -4106,14 +4490,26 @@ public class MainActivity extends Activity {
         }
     }
 
+    /**
+     * v1.37: the countdown duration is mode-dependent - an idle
+     * card lives PAIR_CARD_MS; a pending card's life is capped at
+     * the pairing request's remaining time (recomputed at every
+     * refill, so a pairing-changed restart drains over the right
+     * span and the progress bar tells the request's real story).
+     */
     private void startPairCardCountdown() {
         stopPairCardCountdown();
-        pairCardSecondsLeft = (int) (PAIR_CARD_MS / 1000);
+        long durationMs = PAIR_CARD_MS;
+        if (pairCardPendingMode && remoteServer != null) {
+            long left = remoteServer.pendingPairExpiresInMs();
+            if (left > 0) durationMs = left;
+        }
+        pairCardSecondsLeft = (int) Math.max(1, (durationMs + 999) / 1000);
         updatePairCardCountdownText();
         if (pairCardProgressFill != null) {
             pairCardProgressFill.setScaleX(1f);
             pairCardDrain = ValueAnimator.ofFloat(1f, 0f);
-            pairCardDrain.setDuration(PAIR_CARD_MS);
+            pairCardDrain.setDuration(durationMs);
             pairCardDrain.setInterpolator(new LinearInterpolator());
             pairCardDrain.addUpdateListener(a -> {
                 if (pairCardProgressFill != null)
@@ -4131,19 +4527,31 @@ public class MainActivity extends Activity {
 
     private void updatePairCardCountdownText() {
         if (pairCardCount != null)
-            pairCardCount.setText("Closes in " + pairCardSecondsLeft + "s");
+            pairCardCount.setText(pairCardPendingMode
+                    ? "Expires in " + pairCardSecondsLeft + "s"
+                    : "Closes in " + pairCardSecondsLeft + "s");
     }
 
     /**
      * The card's one action, shared by the mouse/phone tap claim
      * (dispatchTap), the D-pad CENTER interception
-     * (dispatchKeyEvent) and nothing else: server OFF -> turn the
-     * remote on (the panel's exact turn-on sequence), rebuild to
-     * the ON content and restart the full countdown; server ON ->
-     * the card hands over to the full manual pairing panel.
+     * (dispatchKeyEvent) and nothing else: v1.37 PENDING -> TV-side
+     * approval of the pairing request (the sessions-changed
+     * callback runs the "Phone connected ✓" success treatment, so
+     * a phone-confirm racing this tap can't double-celebrate);
+     * server OFF -> turn the remote on (the panel's exact turn-on
+     * sequence), rebuild to the ON content and restart the full
+     * countdown; server ON (idle) -> the card hands over to the
+     * full manual pairing panel. Note: BACK/dismiss of the card
+     * while pending only HIDES it - it does not deny the request;
+     * denial lives in the manual panel.
      */
     private void pairCardAction() {
         if (!pairCardVisible) return;
+        if (remoteOn() && remoteServer.pendingPairCode() != null) {
+            remoteServer.approvePendingFromTv();
+            return;
+        }
         if (!remoteOn()) {
             prefs.edit().putBoolean(KEY_REMOTE, true).apply();
             stopRemoteServer(); // clear any dead instance
@@ -4191,6 +4599,7 @@ public class MainActivity extends Activity {
     private String toolbarTipText(View v) {
         if (v == tbBack) return "Back";
         if (v == tbFwd) return "Forward";
+        if (v == tbPip) return "Picture in Picture";
         if (v == addrCapsule) return "URL";
         if (v == tbReload) return "Reload";
         if (v == tbMode) return browserMouse ? "Mouse" : "D-pad";
@@ -4324,6 +4733,7 @@ public class MainActivity extends Activity {
     }
 
     private void stopRemoteServer() {
+        stopKeyRepeat("disconnect"); // v1.39: a hold never outlives its server
         if (remoteServer == null) return;
         remoteServer.stop();
         remoteServer = null;
@@ -4354,6 +4764,9 @@ public class MainActivity extends Activity {
                     : currentScreen == browserPane ? "browser" : "other");
             o.put("canBack", webView != null && webView.canGoBack());
             o.put("canFwd", webView != null && webView.canGoForward());
+            // v1.36: either PiP is up - the phone's PiP pill
+            // renders as the (accent-lit) way back while true.
+            o.put("pip", nativePip || pipActive);
             o.put("paired", remoteServer != null ? remoteServer.sessionCount() : 0);
             if (remoteNote != null) { o.put("note", remoteNote); remoteNote = null; }
         } catch (Exception ignored) {}
@@ -4427,12 +4840,14 @@ public class MainActivity extends Activity {
             moveCursor(dx, dy); // gain applied server-side (trackpad feel)
         }
         @Override public void remoteTap() {
+            stopEdgePush(); // v1.40: a deliberate phone command ends a latched edge scroll
             if (currentScreen != browserPane) return;
             if (fsView != null) dispatchFsTap(cursorX, cursorY);
             else dispatchTap(cursorX, cursorY);
             if (fsLikeActive()) pokeFsCursor(); // a tap is interaction: un-fade + re-arm
         }
         @Override public void remoteLongTap() {
+            stopEdgePush(); // v1.40: deliberate command ends a latched edge scroll
             if (currentScreen != browserPane) {
                 // v1.25: the phone's trackpad used on a TV menu
                 // (trackpad mode manually picked while off-browser)
@@ -4446,10 +4861,15 @@ public class MainActivity extends Activity {
             else dispatchLongTap(cursorX, cursorY);
             if (fsLikeActive()) pokeFsCursor();
         }
-        @Override public void remoteScroll(int dyRaw) {
+        @Override public void remoteScroll(int dxRaw, int dyRaw) {
+            stopEdgePush(); // v1.40: deliberate command ends a latched edge scroll
             if (currentScreen != browserPane) return;
             float density = getResources().getDisplayMetrics().density;
-            doScrollBy(0, Math.round(dyRaw * density)); // clamps/freezes inside govern
+            // v1.33: both axes route through the one existing
+            // doScrollBy, so the document clamp and the video-
+            // bounded scroll area govern horizontal motion exactly
+            // as they govern vertical.
+            doScrollBy(Math.round(dxRaw * density), Math.round(dyRaw * density));
         }
         @Override public void remoteBack() {
             if (currentScreen == browserPane && webView != null && webView.canGoBack())
@@ -4463,7 +4883,37 @@ public class MainActivity extends Activity {
             if (currentScreen == browserPane && webView != null) webView.reload();
         }
         @Override public void remoteDone() {
+            stopEdgePush(); // v1.40: deliberate command ends a latched edge scroll
+            // v1.34: while the native PiP window floats, the
+            // system's own PiP affordances own dismissal - a
+            // phone Done must not ALSO run closeBrowser (which
+            // could suspend the WebView under the window or try
+            // the in-app PiP). Logged no-op.
+            if (nativePip) {
+                Log.d("HeckYeahFS", "remote done ignored:native-pip");
+                return;
+            }
             if (currentScreen == browserPane) closeBrowser();
+        }
+        @Override public void remotePip() {
+            // v1.36: the phone remote's PiP pill is TWO-WAY. In
+            // the app (browser current, no PiP) it enters PiP via
+            // the shared startPip, like v1.34; while EITHER PiP
+            // floats it is the way BACK - the in-app window
+            // resumes, and the native window is expanded by
+            // bringing our task to the front (the one command the
+            // v1.34 native-PiP gate deliberately lets through:
+            // RemoteServer dispatches {t:"pip"} straight here,
+            // and no earlier check in this handler swallows it).
+            if (pipActive) { resumeFromPip(); return; }
+            if (inNativePip()) { exitNativePipToApp(); return; }
+            // Off-browser with no PiP up: logged no-op (a Toast
+            // would have no context).
+            if (currentScreen != browserPane) {
+                Log.d("HeckYeahFS", "pip start why=phone mode=none");
+                return;
+            }
+            startPip("phone");
         }
         @Override public void remotePlayPause() {
             if (currentScreen != browserPane) return;
@@ -4518,9 +4968,11 @@ public class MainActivity extends Activity {
             catch (Exception ignored) {}
         }
         @Override public void remoteKey(String k) {
+            stopEdgePush(); // v1.40: deliberate command ends a latched edge scroll
             // v1.22 D-pad mode: deliberately NOT browser-gated -
             // these keys drive whichever screen/dialog is current.
             if (k == null) return;
+            stopKeyRepeat("plainkey"); // v1.39: a plain tap supersedes any hold repeat
             int code;
             switch (k) {
                 case "up": code = KeyEvent.KEYCODE_DPAD_UP; break;
@@ -4533,6 +4985,38 @@ public class MainActivity extends Activity {
                 default: return;
             }
             injectKey(code);
+        }
+        @Override public void remoteKeyHold(String k, boolean down) {
+            stopEdgePush(); // v1.40: deliberate command ends a latched edge scroll (remoteMove is the holder's own stream and is exempt)
+            // v1.39: phone D-pad direction hold - the repeat lives
+            // HERE (see startKeyRepeat), not in a phone-side timer
+            // stream. Directions only; ok/back/menu never repeat.
+            if (k == null) return;
+            int code;
+            switch (k) {
+                case "up": code = KeyEvent.KEYCODE_DPAD_UP; break;
+                case "down": code = KeyEvent.KEYCODE_DPAD_DOWN; break;
+                case "left": code = KeyEvent.KEYCODE_DPAD_LEFT; break;
+                case "right": code = KeyEvent.KEYCODE_DPAD_RIGHT; break;
+                default: return;
+            }
+            if (down) startKeyRepeat(k, code);
+            else if (k.equals(keyRepeatKey)) stopKeyRepeat("release");
+        }
+        @Override public void remoteTouch(boolean down) {
+            // v1.39: trackpad engagement heartbeat from the phone.
+            // v1.40: the edge push is LATCHED (see the edgePush
+            // fields), so the heartbeat's only job is to clear a
+            // wind-down deadline while a push is recorded -
+            // engagement re-asserted. It still NEVER creates a
+            // push by itself. On release (last finger lifted), arm
+            // the 150ms glide-out deadline - this replaces v1.39's
+            // freshness backdating, which the latch makes moot.
+            if (down) {
+                if (edgePushX != 0 || edgePushY != 0) edgeStopAt = 0;
+            } else {
+                armEdgeStop();
+            }
         }
         @Override public void remoteVolume(int dir) {
             try {
@@ -4553,6 +5037,7 @@ public class MainActivity extends Activity {
         }
         @Override public void remoteSessionsChanged() {
             int count = pairedCount();
+            if (count == 0) stopKeyRepeat("disconnect"); // v1.39: no phone, no hold
             boolean firstPhone = lastRemotePairedCount == 0 && count > 0;
             lastRemotePairedCount = count;
             if (remotePairCountView != null && remoteServer != null)
@@ -4576,6 +5061,36 @@ public class MainActivity extends Activity {
                 }, 800);
             }
             pushRemoteState();
+        }
+        @Override public void remotePairingChanged() {
+            // v1.37: a pairing request started / expired / was
+            // denied or reset. Refresh whichever TV surfaces are
+            // up, and - for a NEW request - put the code on the TV
+            // via the auto card (this is how the code reaches the
+            // TV when the phone initiates). Suppression rules are
+            // the auto card's own: browser current, no dialog open,
+            // not in real fullscreen; a visible card just refills
+            // (and its countdown restarts at the request's real
+            // remaining time via startPairCardCountdown).
+            refreshPanelPending();
+            String code = remoteServer != null ? remoteServer.pendingPairCode() : null;
+            boolean isNew = code != null && !code.equals(lastPendingPairCode);
+            lastPendingPairCode = code;
+            if (code != null) {
+                if (pairCardVisible) {
+                    fillPairCard();
+                    startPairCardCountdown();
+                } else if (isNew && currentScreen == browserPane && fsView == null
+                        && browserDialogDepth == 0 && openDialog == null) {
+                    showPairCard();
+                }
+            } else if (pairCardVisible && pairCardPendingMode) {
+                // The request vanished under a pending card
+                // (expired / denied / cancelled / reset): fall
+                // back to the idle card with a fresh countdown.
+                fillPairCard();
+                startPairCardCountdown();
+            }
         }
     };
 
@@ -4691,7 +5206,9 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * Pairing panel (TV side): address, QR, PIN, session controls.
+     * Pairing panel (TV side): address, QR, pending-request
+     * section (v1.37: the compare code + Pair/Deny live here -
+     * there is no PIN anymore), session controls.
      * Manual opens only (Phone buttons, menu, settings). v1.28: the
      * v1.27 auto variant of this dialog is GONE - the browser-start
      * auto prompt is the themed in-window CARD now (see the
@@ -4705,8 +5222,9 @@ public class MainActivity extends Activity {
         box.setPadding(dp(24), dp(8), dp(24), dp(4));
         if (!on) {
             box.addView(tv("Phone remote is OFF. Turn it on to control the browser "
-                    + "from a phone on the same Wi-Fi network. Pairing uses a "
-                    + "PIN shown here; the server is off by default.", 15, TEXT, false));
+                    + "from a phone on the same Wi-Fi network. Pairing is confirmed "
+                    + "by matching a code shown on both screens; the server is off "
+                    + "by default.", 15, TEXT, false));
             AlertDialog d = new AlertDialog.Builder(dialogContext())
                     .setTitle("Phone remote")
                     .setView(box)
@@ -4731,9 +5249,6 @@ public class MainActivity extends Activity {
                 + "Android phones may need the IP address above)", 12, DIM, false);
         alt.setPadding(0, dp(4), 0, 0);
         box.addView(alt);
-        TextView pinView = tv("PIN  " + spacedPin(remoteServer.pin()), 30, TEXT, true);
-        pinView.setPadding(0, dp(14), 0, 0);
-        box.addView(pinView);
         try {
             Bitmap qr = renderQrBitmap(url, dp(220));
             if (qr != null) {
@@ -4750,12 +5265,54 @@ public class MainActivity extends Activity {
                 14, DIM, false);
         remotePairCountView.setPadding(0, dp(12), 0, 0);
         box.addView(remotePairCountView);
+        // v1.37: pending-request section. The views always exist
+        // while the panel is open; refreshPanelPending() toggles
+        // them between the live-request state (big code + Pair /
+        // Deny) and the idle line. Pair/Deny refresh the section
+        // IN PLACE - no stacked reopen like the action buttons.
+        panelPendHead = tv("Pairing request", 15, TEXT, true);
+        panelPendHead.setPadding(0, dp(16), 0, 0);
+        box.addView(panelPendHead);
+        panelPendCode = tv("", 30, ACCENT, true);
+        panelPendCode.setPadding(0, dp(4), 0, 0);
+        box.addView(panelPendCode);
+        TextView pendHint = tv("If this code matches the phone, pair it:",
+                13, DIM, false);
+        pendHint.setPadding(0, dp(2), 0, 0);
+        box.addView(pendHint);
+        panelPendHint = pendHint;
+        panelPendRow = new LinearLayout(dialogContext());
+        panelPendRow.setOrientation(LinearLayout.HORIZONTAL);
+        panelPendRow.setPadding(0, dp(8), 0, 0);
+        Button pendPairBtn = new Button(dialogContext());
+        pendPairBtn.setText("Pair this phone");
+        pendPairBtn.setOnClickListener(v -> {
+            if (remoteServer != null) remoteServer.approvePendingFromTv();
+            refreshPanelPending();
+        });
+        panelPendRow.addView(pendPairBtn);
+        Button pendDenyBtn = new Button(dialogContext());
+        pendDenyBtn.setText("Deny");
+        pendDenyBtn.setOnClickListener(v -> {
+            if (remoteServer != null) remoteServer.denyPendingFromTv();
+            refreshPanelPending();
+        });
+        LinearLayout.LayoutParams denyLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        denyLp.leftMargin = dp(12);
+        panelPendRow.addView(pendDenyBtn, denyLp);
+        box.addView(panelPendRow);
+        panelPendIdle = tv("No pairing request right now. Open the remote on a phone"
+                + " and a code will appear here and on the phone.", 13, DIM, false);
+        panelPendIdle.setPadding(0, dp(16), 0, 0);
+        box.addView(panelPendIdle);
+        refreshPanelPending();
         AlertDialog d = new AlertDialog.Builder(dialogContext())
                 .setTitle("Phone remote")
                 .setView(box)
                 .setPositiveButton("Close", null)
-                .setNegativeButton("New PIN", (dlg, w) -> {
-                    if (remoteServer != null) remoteServer.regeneratePinAndDropSessions();
+                .setNegativeButton("Reset pairing", (dlg, w) -> {
+                    if (remoteServer != null) remoteServer.resetPairingAndDropSessions();
                     ui.post(() -> openRemotePanel());
                 })
                 .setNeutralButton("Disconnect all", (dlg, w) -> {
@@ -4769,15 +5326,41 @@ public class MainActivity extends Activity {
         // keeps its label cleanup.
         trackDialog(d, () -> {
             remotePairCountView = null;
+            panelPendHead = null;
+            panelPendCode = null;
+            panelPendHint = null;
+            panelPendRow = null;
+            panelPendIdle = null;
         });
         d.show();
     }
 
-    private static String spacedPin(String pin) {
+    /**
+     * v1.37: refresh the panel's pending section in place. Called
+     * on panel open, from remotePairingChanged(), and after the
+     * section's own Pair/Deny taps. No-op when the panel is shut.
+     */
+    private void refreshPanelPending() {
+        if (panelPendHead == null || remoteServer == null) return;
+        String code = remoteServer.pendingPairCode();
+        boolean pend = code != null;
+        panelPendHead.setVisibility(pend ? View.VISIBLE : View.GONE);
+        panelPendCode.setVisibility(pend ? View.VISIBLE : View.GONE);
+        if (panelPendHint != null) panelPendHint.setVisibility(pend ? View.VISIBLE : View.GONE);
+        if (panelPendRow != null) panelPendRow.setVisibility(pend ? View.VISIBLE : View.GONE);
+        if (panelPendIdle != null) panelPendIdle.setVisibility(pend ? View.GONE : View.VISIBLE);
+        if (pend) panelPendCode.setText(groupedCode(code));
+    }
+
+    /** v1.37: display-group a pairing code - 6 digits as 3 + 3. */
+    private static String groupedCode(String code) {
+        if (code != null && code.length() == 6)
+            return code.substring(0, 3) + " " + code.substring(3);
+        if (code == null) return "";
         StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < pin.length(); i++) {
+        for (int i = 0; i < code.length(); i++) {
             if (i > 0) sb.append(' ');
-            sb.append(pin.charAt(i));
+            sb.append(code.charAt(i));
         }
         return sb.toString();
     }
@@ -4864,6 +5447,11 @@ public class MainActivity extends Activity {
             // HTML5 fullscreen video (the big one for players):
             @Override public void onShowCustomView(View view, CustomViewCallback callback) {
                 if (fsView != null) { try { callback.onCustomViewHidden(); } catch (Exception ignored) {} return; }
+                // v1.33: no fullscreen out of PiP (or any
+                // off-browser state) - the browser isn't the
+                // current full screen then. Refusing the custom
+                // view leaves the page inline, where it already is.
+                if (pipActive || currentScreen != browserPane) { try { callback.onCustomViewHidden(); } catch (Exception ignored) {} return; }
                 showFullscreen(view, callback);
             }
             @Override public void onHideCustomView() { hideFullscreen(); }
@@ -4886,6 +5474,7 @@ public class MainActivity extends Activity {
                 return super.shouldInterceptRequest(view, url);
             }
             @Override public void onPageStarted(WebView view, String url, Bitmap favicon) {
+                stopEdgePush(); // v1.35: a recorded edge push never leaks into a new page
                 clearVideoData(); videoHintShown = false; // v1.15: fresh page, fresh poll data + hint
                 inPageFsLogged = false; pageFsElement = ""; // v1.16: "inpage-fs" logs once per page
                 pageProgress.setVisibility(View.VISIBLE);
@@ -4950,6 +5539,7 @@ public class MainActivity extends Activity {
      */
     private void showFullscreen(View view, WebChromeClient.CustomViewCallback callback) {
         fsView = view; fsCallback = callback;
+        stopEdgePush(); // v1.35: no edge-push loop into fullscreen
         cancelAutoPairPopup(); // v1.28: no pending auto card, and a visible one hides, into fullscreen
         hideToolbarTip(); // v1.25: no toolbar tooltip in fullscreen either
         // v1.15: freeze the page scroll for the whole FS session -
@@ -5043,7 +5633,7 @@ public class MainActivity extends Activity {
         // child; bringToFront re-asserts that over fsContainer).
         if (cursorView != null) cursorView.bringToFront();
         refreshCursor("fs-show"); // v1.32 (was updateCursorVisibility)
-        pokeFsCursor(); // start the 10s idle fade (mouse sub-mode only)
+        pokeFsCursor(); // start the 5s idle fade (cursor: mouse sub-mode; v1.40: header fades in both)
         pushRemoteState(); // v1.19
     }
 
@@ -5454,6 +6044,14 @@ public class MainActivity extends Activity {
     }
 
     private void openEntry(Entry e) {
+        // v1.34: the new-link teardown applies to the IN-APP PiP
+        // only. In native PiP the user is not in the app (a phone
+        // URL is the only realistic caller) - log and ignore.
+        if (nativePip) {
+            Log.d("HeckYeahFS", "pip native: new link ignored while native pip");
+            return;
+        }
+        teardownPipForNewLink(); // v1.33: a new link closes PiP, opens full-screen
         noteOrigin();
         currentEntry = e;
         browserSuspended = false;
@@ -5463,7 +6061,7 @@ public class MainActivity extends Activity {
         // stale image must never pair with a new target meanwhile.
         if (!e.url.equals(resumeUrl)) deleteResumeShot();
         updateResume(e.url, e.name, true); // v1.4: opening replaces the resume target NOW, not at Done
-        toolbarFocus = false; toolbarIndex = 2; styleToolbarFocus();
+        toolbarFocus = false; toolbarIndex = 3; styleToolbarFocus(); // v1.34: URL stop moved to index 3 (PiP at 2)
         // RW session starts only for video-category launches.
         rwActive = "video".equals(e.cat);
         rwSource = e.name;
@@ -5485,10 +6083,15 @@ public class MainActivity extends Activity {
     }
 
     private void openRw(RwItem item) {
+        if (nativePip) { // v1.34: same native-PiP guard as openEntry
+            Log.d("HeckYeahFS", "pip native: new link ignored while native pip");
+            return;
+        }
+        teardownPipForNewLink(); // v1.33: same new-link rule as openEntry
         noteOrigin();
         currentEntry = new Entry("video", "Recently Watched", item.source, item.url, item.title, false, "");
         browserSuspended = false;
-        toolbarFocus = false; toolbarIndex = 2; styleToolbarFocus();
+        toolbarFocus = false; toolbarIndex = 3; styleToolbarFocus(); // v1.34: URL stop moved to index 3 (PiP at 2)
         rwActive = true;
         rwSource = item.source;
         sessUrl = item.url; sessTitle = item.title; sessItem = item;
@@ -5508,6 +6111,15 @@ public class MainActivity extends Activity {
         loadResume(); // v1.4: act on the CURRENT persisted target
         if (resumeUrl == null || resumeUrl.isEmpty()) return;
         final String target = resumeUrl;
+        // v1.33: the resume affordance while PiP is up. If it
+        // points at the very page floating in the window, it IS a
+        // PiP resume (restore, no reload); anything else follows
+        // the new-link rule (tear PiP down, load full-screen).
+        if (pipActive) {
+            String cur = webView != null ? webView.getUrl() : null;
+            if (cur != null && cur.equals(target)) { resumeFromPip(); return; }
+            teardownPipForNewLink();
+        }
         // v1.4: reuse the live session ONLY when the WebView is actually
         // on the button's URL; otherwise load the target fresh.
         boolean liveSession = browserSuspended && target.equals(webView.getUrl());
@@ -5544,16 +6156,525 @@ public class MainActivity extends Activity {
         browserSuspended = false;
     }
 
+    // ------------------------------------------------------ v1.33: in-app PiP
+    //
+    // Kurt: "When going back to the main menu lets have the
+    // browser window play in picture in picture until we resume
+    // that window. If we click a different link that opens the
+    // browser then close that PIP and go to the new site."
+    // API 25 has no Activity PiP, so the PiP window is the
+    // browser pane itself, reparented into a floating frame over
+    // the menu screens. The WebView is never hidden, paused or
+    // suspended while PiP is up - playback just continues small.
+
+    /** Land where the user came from (shared by Done's finalize and PiP entry). */
+    private void landFromBrowser() {
+        if ("cat".equals(originKind) && originCat != null) showCategory(originCat, null);
+        else if ("search".equals(originKind)) showSearch();
+        else showHome();
+    }
+
+    /** PiP frame background: dark glass + hairline; focused = accent ring. */
+    private GradientDrawable pipBg(boolean focused) {
+        GradientDrawable g = new GradientDrawable();
+        g.setColor(Color.parseColor("#1C1C1E"));
+        g.setCornerRadius(dp(16));
+        g.setStroke(focused ? dp(3) : dp(1),
+                focused ? ACCENT : Color.parseColor("#48484A"));
+        return g;
+    }
+
+    /** PiP close-chip background; focused = accent fill. */
+    private GradientDrawable pipChipBg(boolean focused) {
+        GradientDrawable g = new GradientDrawable();
+        g.setColor(focused ? ACCENT : Color.argb(160, 0, 0, 0));
+        g.setCornerRadius(dp(14));
+        return g;
+    }
+
+    // ---------------------------------------------------------- v1.36: PiP settings
+
+    /** In-app PiP window sizes by pip_size pref: {widthDp, heightDp}. */
+    private static final int[][] PIP_SIZES_DP = {{384, 216}, {512, 288}, {640, 360}};
+    private static final String[] PIP_SIZE_LABELS = {"Small", "Medium", "Large"};
+    private static final String[] PIP_CORNER_LABELS =
+            {"Bottom-right", "Bottom-left", "Top-right", "Top-left"};
+
+    private int getPipSize() {
+        int v = prefs.getInt(KEY_PIP_SIZE, 1);
+        return v >= 0 && v < PIP_SIZES_DP.length ? v : 1;
+    }
+    private int getPipCorner() {
+        int v = prefs.getInt(KEY_PIP_CORNER, 0);
+        return v >= 0 && v < PIP_CORNER_LABELS.length ? v : 0;
+    }
+    private String pipSizeLabel() { return PIP_SIZE_LABELS[getPipSize()]; }
+    private String pipCornerLabel() { return PIP_CORNER_LABELS[getPipCorner()]; }
+
+    private void cyclePipSize() {
+        prefs.edit().putInt(KEY_PIP_SIZE, (getPipSize() + 1) % PIP_SIZES_DP.length).apply();
+        refreshSettingsLabels();
+        applyPipFramePrefs(); // live re-apply while the in-app window floats
+    }
+    private void cyclePipCorner() {
+        prefs.edit().putInt(KEY_PIP_CORNER, (getPipCorner() + 1) % PIP_CORNER_LABELS.length).apply();
+        refreshSettingsLabels();
+        applyPipFramePrefs();
+    }
+
+    /**
+     * Layout params for the in-app PiP frame from the size/corner
+     * prefs: the chosen 16:9 size, gravity at the chosen corner,
+     * the standing 20dp margins on that corner's two edges.
+     */
+    private FrameLayout.LayoutParams pipFrameLp() {
+        int[] wh = PIP_SIZES_DP[getPipSize()];
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(dp(wh[0]), dp(wh[1]));
+        int m = dp(20);
+        switch (getPipCorner()) {
+            case 1: // bottom-left
+                lp.gravity = Gravity.BOTTOM | Gravity.LEFT;
+                lp.setMargins(m, 0, 0, m);
+                break;
+            case 2: // top-right
+                lp.gravity = Gravity.TOP | Gravity.RIGHT;
+                lp.setMargins(0, m, m, 0);
+                break;
+            case 3: // top-left
+                lp.gravity = Gravity.TOP | Gravity.LEFT;
+                lp.setMargins(m, m, 0, 0);
+                break;
+            default: // 0: bottom-right
+                lp.gravity = Gravity.BOTTOM | Gravity.RIGHT;
+                lp.setMargins(0, 0, m, m);
+                break;
+        }
+        return lp;
+    }
+
+    /** Re-apply size/corner to a floating in-app PiP window in place. */
+    private void applyPipFramePrefs() {
+        if (pipActive && pipFrame != null && pipFrame.getParent() != null)
+            pipFrame.setLayoutParams(pipFrameLp());
+    }
+
+    /**
+     * v1.34: is a video present per the FRESH (<2s) poll? The
+     * playing-only form (the Done gate, unchanged from v1.33) keys
+     * off videoFound; the lenient form (the PiP buttons) also
+     * accepts a paused-but-present video (poll "p" flag).
+     */
+    private boolean pipVideoPresent(boolean playingOnly) {
+        if (videoDataAt <= 0
+                || System.currentTimeMillis() - videoDataAt >= 2000) return false;
+        if (videoFound) return true;
+        return !playingOnly && videoPresentPaused;
+    }
+
+    /** Native PiP state: our flag, or the platform's own answer. */
+    private boolean inNativePip() {
+        if (nativePip) return true;
+        if (Build.VERSION.SDK_INT >= 24) {
+            try { return isInPictureInPictureMode(); } catch (Exception ignored) {}
+        }
+        return false;
+    }
+
+    /**
+     * v1.36: return from native PiP to the full app (the phone
+     * PiP pill pressed while the window floats over the launcher
+     * or another app). There is NO exit-PiP API on API 24/25 -
+     * the platform expands a PiP activity when its task is
+     * brought to the front, so: relaunch ourselves with
+     * REORDER_TO_FRONT, and belt-and-braces moveTaskToFront
+     * (REORDER_TASKS permission in the manifest). UI restoration
+     * stays in handleNativePipChanged(false) - the mode callback
+     * fires as part of the expansion and is the single restore
+     * path; this method only asks and then verifies. Runs on the
+     * UI thread (Host callbacks post there).
+     */
+    private void exitNativePipToApp() {
+        Log.d("HeckYeahFS", "pip return why=phone");
+        try {
+            Intent it = new Intent(this, MainActivity.class);
+            it.addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT);
+            startActivity(it);
+        } catch (Exception e) {
+            Log.d("HeckYeahFS", "pip return intent threw="
+                    + e.getClass().getSimpleName());
+        }
+        try {
+            ActivityManager am = (ActivityManager) getSystemService(
+                    Context.ACTIVITY_SERVICE);
+            if (am != null) am.moveTaskToFront(getTaskId(), 0);
+        } catch (Exception e) {
+            Log.d("HeckYeahFS", "pip return movetask threw="
+                    + e.getClass().getSimpleName());
+        }
+        // Verify: if Fire OS expanded us, the mode callback has
+        // cleared nativePip (and inNativePip() reads false). If
+        // it did not, this line is the diagnostic.
+        ui.postDelayed(() -> Log.d("HeckYeahFS", "pip return result="
+                + (inNativePip() ? "still-pip" : "expanded")), 700);
+    }
+
+    /**
+     * v1.34: try the NATIVE TV picture-in-picture. TV PiP is API
+     * 24 (the no-arg enterPictureInPictureMode); only the params
+     * overload is 26+, and it is deliberately NOT used - it would
+     * NoSuchMethodError on this Stick. Guards: SDK, the platform
+     * feature flag, browser current. Any refusal is logged and
+     * reported as false so the caller falls back to the in-app
+     * window - never a user-facing error.
+     */
+    @SuppressWarnings("deprecation") // no-arg enterPictureInPictureMode: the API-24 TV form
+    private boolean tryNativePip() {
+        if (Build.VERSION.SDK_INT < 24) {
+            Log.d("HeckYeahFS", "pip native unavailable sdk=" + Build.VERSION.SDK_INT);
+            return false;
+        }
+        try {
+            if (!getPackageManager().hasSystemFeature(
+                    PackageManager.FEATURE_PICTURE_IN_PICTURE)) {
+                Log.d("HeckYeahFS", "pip native unavailable feature");
+                return false;
+            }
+        } catch (Exception e) {
+            Log.d("HeckYeahFS", "pip native unavailable feature-check threw");
+            return false;
+        }
+        if (currentScreen != browserPane || webView == null) return false;
+        // The API-24 no-arg form returns VOID (only the API-26
+        // params overload returns boolean): a call that does not
+        // throw is the success signal - refusal on an unsupported
+        // or disallowed activity throws IllegalStateException.
+        // With the guards above already passed (feature present,
+        // manifest flag set, activity foreground in the browser),
+        // a non-throwing call has been accepted and the mode
+        // callback follows; isInPictureInPictureMode() may still
+        // read false for a few ms while the transition posts, so
+        // it is not consulted here.
+        try {
+            enterPictureInPictureMode();
+            return true;
+        } catch (Exception e) {
+            Log.d("HeckYeahFS", "pip native unavailable threw="
+                    + e.getClass().getSimpleName());
+            return false;
+        }
+    }
+
+    /**
+     * v1.34: the ONE PiP entry, used by the Done gate in
+     * closeBrowser ("done"), the nav-bar PiP button ("button") and
+     * the phone remote's PiP pill ("phone"). Native first; the
+     * v1.33 in-app window is the fallback. Returns true when a PiP
+     * mode was entered (the caller must NOT proceed with any
+     * pause/suspend/Home navigation). Gating: the Done path keeps
+     * its playing-only rule; the buttons accept a paused video
+     * too. A real fullscreen session is torn down first, exactly
+     * as the v1.33 Done gate did, and the inline player PiPs.
+     */
+    private boolean startPip(String why) {
+        if (currentScreen != browserPane || webView == null
+                || pipActive || nativePip) {
+            Log.d("HeckYeahFS", "pip start why=" + why + " mode=none");
+            return false;
+        }
+        boolean present = fsView != null
+                || pipVideoPresent("done".equals(why));
+        if (!present) {
+            Log.d("HeckYeahFS", "pip start why=" + why + " mode=none");
+            if ("button".equals(why) || "phone".equals(why))
+                Toast.makeText(this,
+                        "Picture in Picture needs a video on the page",
+                        Toast.LENGTH_SHORT).show();
+            return false;
+        }
+        if (fsView != null) hideFullscreen();
+        if (tryNativePip()) {
+            Log.d("HeckYeahFS", "pip start why=" + why + " mode=native");
+            return true;
+        }
+        enterPip(); // v1.33 in-app fallback, unchanged semantics
+        if (pipActive) {
+            Log.d("HeckYeahFS", "pip start why=" + why + " mode=inapp");
+            return true;
+        }
+        Log.d("HeckYeahFS", "pip start why=" + why + " mode=none");
+        return false;
+    }
+
+    // v1.34: the platform PiP callback. The one-arg form is the
+    // API-24 original (what Fire OS 6 dispatches); the two-arg
+    // form (API 26+) delegates to the same handler so the logic
+    // exists exactly once.
+    @Override
+    public void onPictureInPictureModeChanged(boolean isInPictureInPictureMode) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode);
+        handleNativePipChanged(isInPictureInPictureMode);
+    }
+
+    @Override
+    public void onPictureInPictureModeChanged(boolean isInPictureInPictureMode,
+                                               Configuration newConfig) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig);
+        handleNativePipChanged(isInPictureInPictureMode);
+    }
+
+    private void handleNativePipChanged(boolean inPip) {
+        if (inPip == nativePip) return;
+        nativePip = inPip;
+        if (inPip) {
+            Log.d("HeckYeahFS", "pip native enter");
+            stopEdgePush(); // v1.35: no edge-push loop under the floating window
+            nativePipHeaderWasHidden = headerHidden;
+            // Nothing of the browser chrome may float over the
+            // small window: card, tooltip, feedback flash, dialog.
+            cancelAutoPairPopup();
+            hideToolbarTip();
+            cancelActionFeedback();
+            if (openDialog != null) {
+                try { openDialog.dismiss(); } catch (Exception ignored) {}
+            }
+            // The session continues; a later return to the full
+            // browser must not re-pop the auto pairing card.
+            autoPairShownThisSession = true;
+            if (headerBlock != null) {
+                headerBlock.animate().cancel();
+                headerBlock.setVisibility(View.GONE);
+                headerBlock.setTranslationY(0);
+                headerBlock.setAlpha(1f);
+            }
+            headerHidden = true; // coherent with the GONE block
+            toolbarFocus = false;
+            refreshCursor("pip-enter"); // nativePip keeps the cursor hidden
+            pushRemoteState(); // v1.36: phones light the PiP pill as the way back (exit already pushes)
+        } else {
+            Log.d("HeckYeahFS", "pip native exit");
+            if (headerBlock != null) {
+                if (nativePipHeaderWasHidden) {
+                    headerBlock.animate().cancel();
+                    headerBlock.setVisibility(View.GONE);
+                    headerBlock.setTranslationY(0);
+                    headerBlock.setAlpha(1f);
+                    headerHidden = true;
+                } else {
+                    showHeader(false);
+                }
+            }
+            refreshCursor("pip-exit");
+            pushRemoteState();
+        }
+    }
+
+    /** Build the floating PiP frame once; reused across sessions. */
+    private void ensurePipFrame() {
+        if (pipFrame != null) return;
+        pipFrameId = View.generateViewId();
+        pipCloseId = View.generateViewId();
+        pipFrame = new FrameLayout(this);
+        pipFrame.setId(pipFrameId);
+        pipFrame.setBackground(pipBg(false));
+        pipFrame.setElevation(dp(12));
+        // Rounded corners clip the pane inside (outline API is 21+).
+        pipFrame.setOutlineProvider(new ViewOutlineProvider() {
+            @Override public void getOutline(View v, Outline outline) {
+                outline.setRoundRect(0, 0, v.getWidth(), v.getHeight(), dp(16));
+            }
+        });
+        pipFrame.setClipToOutline(true);
+        pipFrame.setFocusable(true);
+        pipFrame.setFocusableInTouchMode(false);
+        pipFrame.setContentDescription("Resume browser");
+        // The ✕ chip sits INSIDE the frame's bounds, where plain
+        // focus search from the frame would never descend - wire
+        // the pair explicitly both ways.
+        pipFrame.setNextFocusUpId(pipCloseId);
+        pipFrame.setNextFocusRightId(pipCloseId);
+        pipFrame.setOnClickListener(v -> resumeFromPip());
+        pipFrame.setOnFocusChangeListener((v, has) -> {
+            v.setBackground(pipBg(has));
+            v.setTranslationZ(has ? dp(8) : 0);
+        });
+        pipCloseChip = new TextView(this);
+        pipCloseChip.setId(pipCloseId);
+        pipCloseChip.setText("\u2715");
+        pipCloseChip.setTextSize(13);
+        pipCloseChip.setTextColor(Color.WHITE);
+        pipCloseChip.setGravity(Gravity.CENTER);
+        pipCloseChip.setBackground(pipChipBg(false));
+        pipCloseChip.setFocusable(true);
+        pipCloseChip.setFocusableInTouchMode(false);
+        pipCloseChip.setContentDescription("Close browser window");
+        pipCloseChip.setNextFocusLeftId(pipFrameId);
+        pipCloseChip.setNextFocusDownId(pipFrameId);
+        pipCloseChip.setOnClickListener(v -> closePipToDone());
+        pipCloseChip.setOnFocusChangeListener((v, has) -> v.setBackground(pipChipBg(has)));
+        pipFrame.setVisibility(View.GONE);
+    }
+
+    /**
+     * Enter PiP: reparent browserPane into the floating frame
+     * (size/corner from the v1.36 PiP settings, 20dp margins) above the menu
+     * screen the user lands on, chrome hidden, WebView untouched
+     * and VISIBLE throughout. Caller has already handled the
+     * fullscreen teardown and the pairing-card/tooltip cleanup.
+     */
+    private void enterPip() {
+        if (pipActive || browserPane == null || webView == null) return;
+        ensurePipFrame();
+        pipActive = true;
+        stopEdgePush(); // v1.35: the floating window starts with no edge push
+        // The browser session never ended, so the auto pairing
+        // card stays "already shown" for it - closeBrowser's
+        // preamble reset the flag, and a PiP resume must not
+        // re-pop the card mid-playback.
+        autoPairShownThisSession = true;
+        // The chrome hides for the duration; remember whether it
+        // was auto-hidden so an exit restores the same state.
+        pipHeaderWasHidden = headerHidden;
+        if (headerBlock != null) {
+            headerBlock.animate().cancel();
+            headerBlock.setVisibility(View.GONE);
+            headerBlock.setTranslationY(0);
+            headerBlock.setAlpha(1f);
+        }
+        toolbarFocus = false; styleToolbarFocus();
+        pipSavedBrowserLp = browserPane.getLayoutParams();
+        if (browserPane.getParent() instanceof ViewGroup)
+            ((ViewGroup) browserPane.getParent()).removeView(browserPane);
+        pipFrame.addView(browserPane, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        FrameLayout.LayoutParams chipLp = new FrameLayout.LayoutParams(dp(28), dp(28));
+        chipLp.gravity = Gravity.TOP | Gravity.RIGHT;
+        chipLp.setMargins(0, dp(8), dp(8), 0);
+        pipFrame.addView(pipCloseChip, chipLp);
+        // v1.36: size + corner come from the PiP settings
+        // (defaults preserve the v1.33 window: Medium is the new
+        // default; Small == the old fixed 384x216 bottom-right).
+        contentFrame.addView(pipFrame, pipFrameLp());
+        pipFrame.setVisibility(View.VISIBLE);
+        browserPane.setVisibility(View.VISIBLE); // never GONE in PiP - media must not pause
+        String u = webView.getUrl();
+        Log.d("HeckYeahFS", "pip enter url=" + (u == null || u.isEmpty() ? "?" : hostOf(u)));
+        landFromBrowser();
+        // Land focus ON the frame: OK resumes, UP/RIGHT reaches
+        // the ✕ chip - the window announces itself instead of
+        // hiding in a corner. Home's other focus wiring is
+        // untouched; arrows search outward from here normally.
+        pipFrame.post(() -> { if (pipActive && pipFrame != null) pipFrame.requestFocus(); });
+        pushRemoteState(); // phones already see browser=false via showScreen; keep it fresh
+    }
+
+    /**
+     * Structural PiP teardown shared by every exit: the pane goes
+     * home full-size with its original layout params, the header
+     * state is restored, the frame leaves the window. Does NOT
+     * change currentScreen - each caller lands the user its way.
+     */
+    private void detachPip() {
+        if (!pipActive) return;
+        pipActive = false;
+        if (pipFrame != null) {
+            pipFrame.removeView(browserPane);
+            pipFrame.removeView(pipCloseChip);
+            if (pipFrame.getParent() instanceof ViewGroup)
+                ((ViewGroup) pipFrame.getParent()).removeView(pipFrame);
+            pipFrame.setVisibility(View.GONE);
+        }
+        ViewGroup.LayoutParams lp = pipSavedBrowserLp != null ? pipSavedBrowserLp
+                : new FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT);
+        pipSavedBrowserLp = null;
+        contentFrame.addView(browserPane, lp);
+        if (headerBlock != null) {
+            if (pipHeaderWasHidden) {
+                headerHidden = true;
+                headerBlock.animate().cancel();
+                headerBlock.setVisibility(View.GONE);
+                headerBlock.setTranslationY(0);
+                headerBlock.setAlpha(1f);
+            } else {
+                showHeader(false);
+            }
+        }
+    }
+
+    /** PiP frame activated (CENTER / tap): browser back full-size. */
+    private void resumeFromPip() {
+        if (!pipActive) return;
+        Log.d("HeckYeahFS", "pip exit reason=resume");
+        detachPip();
+        showScreen(browserPane); // poll + scroll-lock gates resume from here
+    }
+
+    /**
+     * PiP ✕ chip: end the window into the LEGACY Done state. The
+     * pane is first restored and shown (the Done path's snapshot
+     * capture needs the browser on screen), then closeBrowser
+     * runs with the PiP trigger disarmed so it lands legacy -
+     * JS pause + suspend + resume bar, exactly as Done today.
+     */
+    private void closePipToDone() {
+        if (!pipActive) return;
+        Log.d("HeckYeahFS", "pip exit reason=close");
+        detachPip();
+        showScreen(browserPane);
+        closeBrowser(false);
+    }
+
+    /**
+     * Kurt's new-link rule: any fresh browser launch while PiP is
+     * up closes PiP first and opens full-screen - nothing ever
+     * navigates inside the small window. Structural restore only;
+     * the caller's normal open path (showScreen + loadUrl) takes
+     * it from there and discards the old page as usual.
+     */
+    private void teardownPipForNewLink() {
+        if (!pipActive) return;
+        Log.d("HeckYeahFS", "pip exit reason=newlink");
+        detachPip();
+    }
+
     /**
      * Done: snapshot the current page (RW + resume state), pause ALL
      * media, suspend timers, and leave the browser WITHOUT destroying
      * the WebView or blanking the page, so Back-to can resume it.
      */
-    private void closeBrowser() {
+    private void closeBrowser() { closeBrowser(true); }
+
+    private void closeBrowser(boolean allowPip) {
         cancelAutoPairPopup(); // v1.27: dismiss the auto popup + cancel its countdown
         hideToolbarTip(); // v1.25
         cancelActionFeedback(); // v1.26: no feedback flash outlives the browser
+        stopEdgePush(); // v1.35: leaving the browser (Done, PiP gate, legacy) kills any edge push
         autoPairShownThisSession = false; // v1.27: next browser launch may auto-pop again
+        // v1.33 (Part 3): the PiP trigger. Leaving the browser
+        // with a video playing floats the window instead of the
+        // legacy Done below - no JS pause, no suspend, no resume
+        // snapshot: the session simply continues small. "Playing"
+        // = the fresh (<2s) poll says a video is going (pseudo-FS
+        // is a poll state, so it counts), or a real fullscreen
+        // session is up (torn down first, then PiP - the inline
+        // player keeps going). A browser dialog being open means
+        // Done isn't really reachable; those callers keep the
+        // legacy path.
+        // v1.34: the gate now routes through the unified
+        // startPip("done") - NATIVE TV PiP first (the activity
+        // itself floats over the launcher; this method simply
+        // returns and nothing navigates Home), the v1.33 in-app
+        // window as fallback. startPip returning false (no
+        // playing video) falls through to the legacy Done below,
+        // exactly as the v1.33 gate did.
+        if (allowPip && !pipActive && browserDialogDepth == 0) {
+            // v1.36: the Auto-PiP setting can disarm the Done
+            // trigger entirely (the PiP buttons still work).
+            if (!prefs.getBoolean(KEY_PIP_AUTO, true)) {
+                Log.d("HeckYeahFS", "pip auto-done off");
+            } else if (startPip("done")) return;
+        }
         clearVideoData(); // v1.15: poll loop self-stops once another screen shows
         cancelFsFade(); // v1.17: a pseudo-FS exit via Done never reaches hideFullscreen (fsView is null) - never carry a faded cursor or a live fade timer out of the browser
         showHeader(false); // v1.4: restore the bar even if auto-hidden
@@ -5589,9 +6710,7 @@ public class MainActivity extends Activity {
             try { webView.pauseTimers(); } catch (Exception ignored) {}
             rwActive = false;
             // Land back where the user came from (bar shows on top there).
-            if ("cat".equals(originKind) && originCat != null) showCategory(originCat, null);
-            else if ("search".equals(originKind)) showSearch();
-            else showHome();
+            landFromBrowser();
             pushRemoteState(); // v1.19: phones see the browser is gone
         };
         // RW snapshot + playback position first (async JS), then finalize.
@@ -5952,6 +7071,7 @@ public class MainActivity extends Activity {
 
     /** Mouse sub-mode lives ONLY inside the browser now. */
     private void setBrowserMouse(boolean on, boolean announce) {
+        stopEdgePush(); // v1.35: a mode toggle kills any edge push (cursor also recenters when turning on)
         browserMouse = on;
         prefs.edit().putBoolean(KEY_MOUSE, on).apply();
         if (tbMode != null) updateModeBtn(); // v1.25: icon, not text
@@ -6101,6 +7221,19 @@ public class MainActivity extends Activity {
                 }
                 return;
             }
+            if (up) {
+                // v1.40: releasing a physical arrow ends a latched
+                // edge push on its axis after the glide-out (arrow
+                // ups were unhandled in this branch before; the
+                // latch has no freshness death to fall back on).
+                switch (code) {
+                    case KeyEvent.KEYCODE_DPAD_UP: case KeyEvent.KEYCODE_DPAD_DOWN:
+                        if (edgePushY != 0) armEdgeStop(); break;
+                    case KeyEvent.KEYCODE_DPAD_LEFT: case KeyEvent.KEYCODE_DPAD_RIGHT:
+                        if (edgePushX != 0) armEdgeStop(); break;
+                    default: break;
+                }
+            }
             if (down) {
                 int step = prefs.getInt(KEY_CURSOR_STEP, 52);
                 if (e.isShiftPressed()) step = 12;
@@ -6201,7 +7334,7 @@ public class MainActivity extends Activity {
      * fullscreen.
      */
     private void handleFullscreenKey(KeyEvent e, int code) {
-        pokeFsCursor(); // any handled key = interaction: cursor back + 10s timer restarts
+        pokeFsCursor(); // any handled key = interaction: cursor back + 5s timer restarts
         boolean down = e.getAction() == KeyEvent.ACTION_DOWN;
         boolean up = e.getAction() == KeyEvent.ACTION_UP;
         boolean center = code == KeyEvent.KEYCODE_DPAD_CENTER || code == KeyEvent.KEYCODE_ENTER
@@ -6391,6 +7524,10 @@ public class MainActivity extends Activity {
         hideToolbarTip(); // v1.25: activation is a click - bubble goes away
         View v = toolbarViews.get(toolbarIndex);
         if (v == addrCapsule) { openUrlDialog(); return; }
+        // v1.34: the toolbar controls are FrameLayouts (v1.30),
+        // not Buttons - PiP activates its click listener directly
+        // (View.performClick) so the D-pad path reaches startPip.
+        if (v == tbPip) { v.performClick(); return; }
         if (v instanceof Button) ((Button) v).performClick();
     }
 
@@ -6770,27 +7907,38 @@ public class MainActivity extends Activity {
         // no alpha is touched, and pokeFsCursor schedules nothing
         // while fsLikeActive() is false.
         pokeFsCursor();
+        // v1.35: moving AWAY from an edge cancels that edge's
+        // recorded push (the loop also drops axes the cursor has
+        // left, and stale pushes die on their own).
+        if (dy > 0 && edgePushY < 0) edgePushY = 0;
+        if (dy < 0 && edgePushY > 0) edgePushY = 0;
+        if (dx > 0 && edgePushX < 0) edgePushX = 0;
+        if (dx < 0 && edgePushX > 0) edgePushX = 0;
         // Edge-push scrolling over the browser page (Fetch v1.1 pattern).
         boolean onBrowser = currentScreen == browserPane && fsView == null;
         int pageTop = -1;
-        boolean transitScrolledUp = false;
+        boolean transitPushedUp = false;
         if (onBrowser) {
             int[] loc = new int[2]; webView.getLocationInWindow(loc);
             int wr = loc[0] + webView.getWidth(), wb = loc[1] + webView.getHeight();
             pageTop = loc[1];
             if (cursorX >= loc[0] && cursorX <= wr && cursorY >= loc[1] && cursorY <= wb) {
-                if (dy > 0 && cursorY + dy > wb) doScrollBy(0, dp(140));
+                // v1.35: crossings RECORD a push instead of
+                // scrolling on the spot; the edge loop scrolls
+                // at a capped, time-based velocity while pushes
+                // stay fresh (see the edgePush fields).
+                if (dy > 0 && cursorY + dy > wb) noteEdgePush(0, 1);
                 if (dy < 0 && cursorY + dy < loc[1]) {
-                    // v1.15: the transit counts as scrolled only if
-                    // the (possibly clamped) scroll actually moved
-                    // the page - otherwise the top-edge rule below
-                    // still gets its turn on this same move.
-                    int beforeY = webView.getScrollY();
-                    doScrollBy(0, -dp(140));
-                    transitScrolledUp = webView.getScrollY() != beforeY;
+                    // v1.11/v1.15 bookkeeping, push edition: the
+                    // crossing already recorded the up-push, so
+                    // the top-edge rule below must not record it
+                    // again for this same move (idempotent anyway,
+                    // but the structure is kept explicit).
+                    noteEdgePush(0, -1);
+                    transitPushedUp = true;
                 }
-                if (dx > 0 && cursorX + dx > wr) doScrollBy(dp(80), 0);
-                if (dx < 0 && cursorX + dx < loc[0]) doScrollBy(-dp(80), 0);
+                if (dx > 0 && cursorX + dx > wr) noteEdgePush(1, 0);
+                if (dx < 0 && cursorX + dx < loc[0]) noteEdgePush(-1, 0);
             }
         }
         int maxX = windowRoot.getWidth() > 0 ? windowRoot.getWidth() : getResources().getDisplayMetrics().widthPixels;
@@ -6800,7 +7948,7 @@ public class MainActivity extends Activity {
         if (dy < 0 && onBrowser) {
             // v1.4: pushing the cursor against the TOP edge of the screen
             // while the header is auto-hidden brings the bar back.
-            if (cursorY <= 0 && headerHidden) showHeader(true);
+            if (cursorY <= 0 && headerHidden && !nativePip) showHeader(true); // v1.34: not inside the PiP window
             // v1.11: the reveal must not eat the gesture. Once the header
             // shows, the WebView's top edge drops to below the cursor
             // (the cursor stays parked at screen y=0, over the bar), so
@@ -6811,11 +7959,14 @@ public class MainActivity extends Activity {
             // the screen top, or parked above the page's top edge, while
             // pushing up = scroll up. This is keyed to the cursor, not
             // to page geometry, so the header's show/hide layout change
-            // cannot disarm it; the transit check's own scroll on the
+            // cannot disarm it; the transit check's own push on the
             // crossing move is not doubled.
-            if (!transitScrolledUp
+            // v1.35: this records the same up-push the crossing
+            // records (the edge loop does the scrolling; v1.15's
+            // bounded scroll area still applies inside doScrollBy).
+            if (!transitPushedUp
                     && (cursorY <= 0 || (pageTop >= 0 && cursorY < pageTop)))
-                doScrollBy(0, -dp(140)); // v1.15: the bounded scroll area applies here too
+                noteEdgePush(0, -1);
         }
         cursorView.invalidate();
         updateToolbarHover(); // v1.25: name bubble follows the cursor over the toolbar
